@@ -248,10 +248,10 @@ class Slack:
                 self._users[uid] = uid
         return self._users[uid]
 
-    def react(self, kind, target, ts, emoji):
+    def react(self, kind, target, ts, emoji, remove=False):
         cid = self.target_id(kind, target)
-        self.api("reactions.add", channel=cid, timestamp=ts,
-                 name=emoji.strip(":"))
+        self.api("reactions.remove" if remove else "reactions.add",
+                 channel=cid, timestamp=ts, name=emoji.strip(":"))
 
     def send(self, kind, target, text, thread=None):
         # chat.postMessage resolves #names itself for channels the bot is in
@@ -339,6 +339,9 @@ class Slack:
                 "owner": bool(self.owner) and m.get("user") == self.owner,
                 "text": m.get("text", ""),
             }
+            if m.get("reactions"):
+                entry["reactions"] = {r["name"]: r.get("count", 1)
+                                      for r in m["reactions"]}
             if files and m.get("files"):
                 paths = [p for f in m["files"]
                          if (p := self._fetch_file(f))]
@@ -515,6 +518,9 @@ def fmt(m, addr=None):
     who = m["from"] + (" (owner)" if m.get("owner") else "")
     where = f"{addr} " if addr else ""
     line = f"[{where}{m['ts']}] {who}: {m['text']}"
+    if m.get("reactions"):
+        line += "  {" + " ".join(f":{n}:x{c}"
+                                 for n, c in m["reactions"].items()) + "}"
     for p in m.get("files") or []:
         line += f"\n  [attachment: {p}]"
     if m.get("files_note"):
@@ -558,10 +564,11 @@ def main():
                    help="don't download attachments")
     p.add_argument("--json", action="store_true", help="JSONL output")
 
-    p = sub.add_parser("react", help="add a reaction emoji to a Slack message")
+    p = sub.add_parser("react", help="add/remove a reaction emoji on a Slack message")
     p.add_argument("addr")
     p.add_argument("ts")
     p.add_argument("emoji")
+    p.add_argument("--remove", action="store_true")
 
     p = sub.add_parser("channels", help="list channels the bot can see")
     p.add_argument("env", nargs="?")
@@ -613,7 +620,8 @@ def main():
         if args.cmd == "react":
             if not isinstance(client, Slack):
                 die("react is Slack-only")
-            client.react(kind, target, args.ts, args.emoji)
+            client.react(kind, target, args.ts, args.emoji,
+                         remove=args.remove)
             return
         text = " ".join(args.text) if args.text \
             else ("" if getattr(args, "files", None) else sys.stdin.read().strip())
