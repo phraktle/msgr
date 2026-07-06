@@ -7,7 +7,8 @@ takes args or stdin, output is plain chronological text (or --json).
 
 Addresses:
     env#channel      channel in a named environment (Slack channel, Telegram chat)
-    env@person       direct message to a person in that environment
+    env@person       direct message with a person in that environment
+    @                the operator's DM (config owner; Telegram: Saved Messages)
     #channel  @person   the default environment ($MSGR_ENV, or config
                         default_env, or the only one configured)
     ops              any alias defined in the config
@@ -18,6 +19,7 @@ Examples:
     msgr read "news@weather_updates" --as morning-loop
     msgr read "#alerts" "#ops" "news@daily" --as watcher --block --timeout 3600
     msgr read "#alerts" --last 50
+    msgr read "@" "#alerts" --as me --block      # poll own DMs + a channel
 
 Patterns (for agents):
   * Always pass a stable --as <consumer> (e.g. your loop/agent name): cursors
@@ -62,7 +64,7 @@ STATE_DIR = pathlib.Path(
     os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
 ) / "msgr"
 
-ADDR_RE = re.compile(r"^([A-Za-z0-9_-]*)([#@])(.+)$")
+ADDR_RE = re.compile(r"^([A-Za-z0-9_-]*)([#@])(.*)$")
 FILE_CAP = 20 * 1024 * 1024  # skip attachment downloads larger than this
 
 
@@ -105,6 +107,8 @@ def resolve_addr(cfg, addr):
         die(f"bad address '{addr}' — expected [env]#channel or [env]@person, "
             f"or an alias from the config")
     env_name, kind, target = m.groups()
+    if kind == "#" and not target:
+        die(f"bad address '{addr}': empty channel name")
     name, env = pick_env(cfg, env_name or None)
     return name, env, kind, target
 
@@ -191,6 +195,11 @@ class Slack:
 
     def target_id(self, kind, target):
         if kind == "@":
+            if not target:
+                if not self.owner:
+                    die(f"'@' needs an owner configured for env "
+                        f"'{self.env_name}'")
+                target = self.owner
             uid = target if re.fullmatch(r"[UW][A-Z0-9]{8,}", target) \
                 else self._find_user(target)
             return self.api("conversations.open", users=uid)["channel"]["id"]
@@ -401,6 +410,8 @@ class Telegram:
 
     @staticmethod
     def _entity(kind, target):
+        if kind == "@" and not target:
+            return "me"  # Telegram: own Saved Messages
         if re.fullmatch(r"-?\d+", target):
             return int(target)
         return target if target.startswith("@") else "@" + target
