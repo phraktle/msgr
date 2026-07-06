@@ -500,16 +500,14 @@ def main():
         client.listen(args.json)
         return
 
-    env_name, env, kind, target = resolve_addr(cfg, args.addr)
-    client = platform_client(env_name, env)
-
-    if args.cmd == "react":
-        if not isinstance(client, Slack):
-            die("react is Slack-only")
-        client.react(kind, target, args.ts, args.emoji)
-        return
-
-    if args.cmd == "send":
+    if args.cmd in ("react", "send"):
+        env_name, env, kind, target = resolve_addr(cfg, args.addr)
+        client = platform_client(env_name, env)
+        if args.cmd == "react":
+            if not isinstance(client, Slack):
+                die("react is Slack-only")
+            client.react(kind, target, args.ts, args.emoji)
+            return
         text = " ".join(args.text) if args.text else sys.stdin.read().strip()
         if not text:
             die("empty message")
@@ -518,18 +516,55 @@ def main():
         return
 
     if args.cmd == "read":
-        cursor = None if args.last \
-            else cursor_get(args.consumer, env_name, kind, target)
-        limit = args.last or args.limit
-        first_read = cursor is None and not args.last
-        msgs, new_cursor = client.read(kind, target, cursor=cursor, limit=limit)
-        if first_read:
-            msgs = msgs[-20:]  # first contact: don't dump entire history
-        for m in msgs:
-            print(json.dumps(m, ensure_ascii=False) if args.json else fmt(m))
-        if not args.peek and not args.last and new_cursor:
-            cursor_set(args.consumer, env_name, kind, target, new_cursor)
-        return
+        import time
+        clients, targets = {}, []
+        for a in args.addrs:
+            en, env, k, t = resolve_addr(cfg, a)
+            if en not in clients:
+                clients[en] = platform_client(en, env)
+            targets.append((a, en, clients[en], k, t))
+        multi = len(targets) > 1
+
+        def read_one(a, en, cl, k, t, cursor):
+            kw = {"threads": not args.no_threads} \
+                if isinstance(cl, Slack) else {}
+            return cl.read(k, t, cursor=cursor,
+                           limit=args.last or args.limit, **kw)
+
+        if args.block:
+            # blocking starts "from now": initialize fresh cursors so we
+            # never fire on old history
+            for a, en, cl, k, t in targets:
+                if cursor_get(args.consumer, en, k, t) is None:
+                    _, nc = read_one(a, en, cl, k, t, None)
+                    if nc:
+                        cursor_set(args.consumer, en, k, t, nc)
+
+        deadline = time.time() + args.timeout if args.timeout else None
+        while True:
+            results, any_new = [], False
+            for a, en, cl, k, t in targets:
+                cursor = None if args.last \
+                    else cursor_get(args.consumer, en, k, t)
+                msgs, nc = read_one(a, en, cl, k, t, cursor)
+                if args.last:
+                    msgs = msgs[-args.last:]
+                elif cursor is None:
+                    msgs = msgs[-20:]  # first contact: don't dump history
+                any_new = any_new or bool(msgs)
+                results.append((a, en, k, t, msgs, nc))
+            if any_new or not args.block:
+                for a, en, k, t, msgs, nc in results:
+                    for m in msgs:
+                        m["addr"] = a
+                        print(json.dumps(m, ensure_ascii=False) if args.json
+                              else fmt(m, a if multi else None))
+                    if not args.peek and not args.last and nc:
+                        cursor_set(args.consumer, en, k, t, nc)
+                return
+            if deadline and time.time() >= deadline:
+                sys.exit(3)
+            time.sleep(args.interval)
 
 
 if __name__ == "__main__":
