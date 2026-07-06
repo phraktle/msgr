@@ -1,13 +1,22 @@
 #!/usr/bin/env python3
-"""msgr — minimal multi-platform channel mailbox CLI (Slack, Telegram).
+"""msgr — minimal multi-environment channel mailbox CLI (Slack, Telegram).
 
-Built for LLM agents and shell scripts: read is a mailbox (returns only new
-messages, advances a per-consumer cursor), send takes stdin or args, output is
-plain chronological text (or --json).
+Built for LLM agents and shell scripts: `read` is a mailbox (returns only new
+messages since that consumer's last read, then advances a cursor), `send`
+takes args or stdin, output is plain chronological text (or --json).
 
-    msgr send slack:#ops "deploy done"
-    msgr read tg:@binance_announcements
-    echo "report..." | msgr send minion
+Addresses:
+    env#channel      channel in a named environment (Slack channel, Telegram chat)
+    env@person       direct message to a person in that environment
+    #channel  @person   the default environment ($MSGR_ENV, or config
+                        default_env, or the only one configured)
+    ops              any alias defined in the config
+
+Examples:
+    msgr send "#ops" "deploy finished"
+    echo "long report..." | msgr send standup
+    msgr read "news@weather_updates" --as morning-loop
+    msgr read "#alerts" --last 50
 """
 
 import argparse
@@ -21,12 +30,14 @@ import urllib.request
 
 CONFIG_CANDIDATES = [
     os.environ.get("MSGR_CONFIG"),
-    "/etc/phraklaude/msgr.toml",
     os.path.expanduser("~/.config/msgr/config.toml"),
+    "/etc/msgr/config.toml",
 ]
 STATE_DIR = pathlib.Path(
     os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
 ) / "msgr"
+
+ADDR_RE = re.compile(r"^([A-Za-z0-9_-]*)([#@])(.+)$")
 
 
 def die(msg, code=1):
@@ -37,55 +48,62 @@ def die(msg, code=1):
 def load_config():
     import tomllib
 
-    cfg = {}
     for p in CONFIG_CANDIDATES:
         if p and os.path.isfile(p):
             with open(p, "rb") as f:
-                cfg = tomllib.load(f)
-            break
-    # env-file fallbacks: tokens may live in plain KEY=VALUE env files
-    for envfile in cfg.get("env_files", ["/etc/phraklaude/slack.env",
-                                         "/etc/phraklaude/telegram.env"]):
-        if os.path.isfile(envfile) and os.access(envfile, os.R_OK):
-            for line in open(envfile):
-                line = line.strip()
-                if line and not line.startswith("#") and "=" in line:
-                    k, _, v = line.partition("=")
-                    os.environ.setdefault(k.strip(), v.strip())
-    return cfg
+                return tomllib.load(f)
+    return {}
+
+
+def pick_env(cfg, name=None):
+    envs = cfg.get("envs", {})
+    if not envs:
+        die("no environments configured (add [envs.<name>] to the config)")
+    name = (name or os.environ.get("MSGR_ENV") or cfg.get("default_env")
+            or (next(iter(envs)) if len(envs) == 1 else None))
+    if not name:
+        die("multiple environments configured — set default_env or $MSGR_ENV")
+    if name not in envs:
+        die(f"unknown environment '{name}'")
+    return name, envs[name]
 
 
 def resolve_addr(cfg, addr):
-    """Return (platform, target). Accepts alias, slack:#x, slack:CID, tg:@x,
-    bare #x / CID (assumed Slack), bare @x (assumed Telegram)."""
-    aliases = cfg.get("aliases", {})
-    if addr in aliases:
+    """Return (env_name, env_cfg, kind, target); kind is '#' or '@'."""
+    aliases, seen = cfg.get("aliases", {}), set()
+    while addr in aliases and addr not in seen:
+        seen.add(addr)
         addr = aliases[addr]
-    if ":" in addr:
-        plat, _, target = addr.partition(":")
-        plat = {"telegram": "tg"}.get(plat, plat)
-        if plat not in ("slack", "tg"):
-            die(f"unknown platform in address: {addr}")
-        return plat, target
-    if addr.startswith("@"):
-        return "tg", addr
-    if addr.startswith("#") or re.fullmatch(r"[CGD][A-Z0-9]{8,}", addr):
-        return "slack", addr
-    die(f"cannot resolve address '{addr}' (no alias, no platform prefix)")
+    m = ADDR_RE.match(addr)
+    if not m:
+        die(f"bad address '{addr}' — expected [env]#channel or [env]@person, "
+            f"or an alias from the config")
+    env_name, kind, target = m.groups()
+    name, env = pick_env(cfg, env_name or None)
+    return name, env, kind, target
 
 
-def cursor_path(consumer, plat, target):
-    safe = re.sub(r"[^A-Za-z0-9@#._-]", "_", f"{plat}:{target}")
+def platform_client(env_name, env):
+    plat = env.get("platform")
+    if plat == "slack":
+        return Slack(env_name, env)
+    if plat == "telegram":
+        return Telegram(env_name, env)
+    die(f"environment '{env_name}': unknown platform '{plat}'")
+
+
+def cursor_path(consumer, env_name, kind, target):
+    safe = re.sub(r"[^A-Za-z0-9@#._-]", "_", f"{env_name}{kind}{target}")
     return STATE_DIR / "cursors" / f"{consumer}~{safe}"
 
 
-def cursor_get(consumer, plat, target):
-    p = cursor_path(consumer, plat, target)
+def cursor_get(consumer, env_name, kind, target):
+    p = cursor_path(consumer, env_name, kind, target)
     return p.read_text().strip() if p.exists() else None
 
 
-def cursor_set(consumer, plat, target, value):
-    p = cursor_path(consumer, plat, target)
+def cursor_set(consumer, env_name, kind, target, value):
+    p = cursor_path(consumer, env_name, kind, target)
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(str(value))
 
@@ -93,11 +111,12 @@ def cursor_set(consumer, plat, target, value):
 # ---------------------------------------------------------------- Slack
 
 class Slack:
-    def __init__(self, cfg):
-        s = cfg.get("slack", {})
-        self.token = s.get("bot_token") or os.environ.get("SLACK_BOT_TOKEN")
+    def __init__(self, env_name, env):
+        self.env_name = env_name
+        self.token = env.get("bot_token")
+        self.app_token = env.get("app_token")
         if not self.token:
-            die("no Slack bot token (config slack.bot_token or SLACK_BOT_TOKEN)")
+            die(f"environment '{env_name}': no bot_token")
         self._users = {}
 
     def api(self, method, _quiet=False, **params):
@@ -113,11 +132,28 @@ class Slack:
             die(f"slack {method}: {resp.get('error')}")
         return resp
 
-    def resolve_channel(self, target):
+    def _find_user(self, name):
+        name = name.lstrip("@").lower()
+        cursor = ""
+        while True:
+            resp = self.api("users.list", limit=500, cursor=cursor)
+            for u in resp["members"]:
+                cands = {u.get("name", ""), u.get("real_name", ""),
+                         u.get("profile", {}).get("display_name", "")}
+                if name in {c.lower() for c in cands if c}:
+                    return u["id"]
+            cursor = resp.get("response_metadata", {}).get("next_cursor", "")
+            if not cursor:
+                die(f"user '@{name}' not found")
+
+    def target_id(self, kind, target):
+        if kind == "@":
+            uid = target if re.fullmatch(r"[UW][A-Z0-9]{8,}", target) \
+                else self._find_user(target)
+            return self.api("conversations.open", users=uid)["channel"]["id"]
         if re.fullmatch(r"[CGD][A-Z0-9]{8,}", target):
             return target
-        name = target.lstrip("#")
-        cursor = ""
+        name, cursor = target.lstrip("#"), ""
         while True:
             resp = self.api("conversations.list", types="public_channel",
                             limit=999, cursor=cursor)
@@ -126,177 +162,187 @@ class Slack:
                     return c["id"]
             cursor = resp.get("response_metadata", {}).get("next_cursor", "")
             if not cursor:
-                break
-        die(f"channel {target} not found — private channels need an ID or an "
-            f"alias in the config (bot lacks groups:read)")
+                die(f"channel #{name} not found — private channels need an ID "
+                    f"or an alias (or grant the app groups:read)")
 
     def username(self, uid):
         if not uid:
             return "?"
         if uid not in self._users:
             try:
-                u = self.api("users.info", user=uid)["user"]
+                u = self.api("users.info", _quiet=True, user=uid)["user"]
                 self._users[uid] = u.get("profile", {}).get("display_name") \
                     or u.get("real_name") or uid
             except SystemExit:
                 self._users[uid] = uid
         return self._users[uid]
 
-    def react(self, target, ts, emoji):
-        cid = self.resolve_channel(target)
-        self.api("reactions.add", channel=cid, timestamp=ts, name=emoji.strip(":"))
+    def react(self, kind, target, ts, emoji):
+        cid = self.target_id(kind, target)
+        self.api("reactions.add", channel=cid, timestamp=ts,
+                 name=emoji.strip(":"))
 
-    def send(self, target, text, thread=None):
-        params = {"channel": target, "text": text}
+    def send(self, kind, target, text, thread=None):
+        params = {"channel": self.target_id(kind, target), "text": text}
         if thread:
             params["thread_ts"] = thread
         resp = self.api("chat.postMessage", **params)
         return {"channel": resp["channel"], "ts": resp["ts"]}
 
-    def read(self, target, cursor=None, limit=100):
-        """Return (messages_oldest_first, new_cursor). cursor = slack ts."""
-        cid = self.resolve_channel(target)
+    def read(self, kind, target, cursor=None, limit=100):
+        cid = self.target_id(kind, target)
         params = {"channel": cid, "limit": min(limit, 200)}
         if cursor:
-            params["oldest"] = cursor  # exclusive by default
+            params["oldest"] = cursor  # exclusive
         resp = self.api("conversations.history", **params)
         msgs = list(reversed(resp["messages"]))
         out = [{
-            "platform": "slack", "channel": cid, "ts": m["ts"],
+            "env": self.env_name, "channel": cid, "ts": m["ts"],
             "thread": m.get("thread_ts"),
             "from": self.username(m.get("user") or m.get("bot_id")),
             "text": m.get("text", ""),
         } for m in msgs]
-        new_cursor = msgs[-1]["ts"] if msgs else cursor
-        return out, new_cursor
+        return out, (msgs[-1]["ts"] if msgs else cursor)
+
+    def channels(self):
+        try:
+            chans = self.api("users.conversations", _quiet=True,
+                             types="public_channel,private_channel",
+                             limit=200)["channels"]
+            note = ""
+        except SystemExit:
+            chans = self.api("users.conversations", types="public_channel",
+                             limit=200)["channels"]
+            note = ("(private channels hidden: app lacks groups:read; "
+                    "use IDs or aliases)")
+        return [(c["id"], "#" + c["name"],
+                 "private" if c.get("is_private") else "public")
+                for c in chans], note
+
+    def listen(self, json_out):
+        if not self.app_token:
+            die(f"environment '{self.env_name}': listen needs app_token "
+                f"(Slack app-level token with connections:write)")
+        try:
+            import websocket
+        except ImportError:
+            die("websocket-client not installed (pip install 'msgr[listen]')")
+        import time
+
+        while True:
+            try:
+                req = urllib.request.Request(
+                    "https://slack.com/api/apps.connections.open", data=b"",
+                    headers={"Authorization": f"Bearer {self.app_token}"})
+                resp = json.load(urllib.request.urlopen(req, timeout=30))
+                if not resp.get("ok"):
+                    die(f"apps.connections.open: {resp.get('error')}")
+                ws = websocket.create_connection(resp["url"], timeout=120)
+                while True:
+                    try:
+                        raw = ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        ws.ping()
+                        continue
+                    env = json.loads(raw)
+                    if env.get("type") == "disconnect":
+                        break
+                    if env.get("envelope_id"):
+                        ws.send(json.dumps({"envelope_id": env["envelope_id"]}))
+                    if env.get("type") != "events_api":
+                        continue
+                    ev = env.get("payload", {}).get("event", {})
+                    if ev.get("type") != "message" or ev.get("subtype"):
+                        continue
+                    m = {"env": self.env_name, "channel": ev.get("channel"),
+                         "user": ev.get("user"), "bot_id": ev.get("bot_id"),
+                         "ts": ev.get("ts"), "thread": ev.get("thread_ts"),
+                         "text": ev.get("text", "")}
+                    print(json.dumps(m, ensure_ascii=False) if json_out
+                          else f"[{m['ts']}] {m['channel']} "
+                               f"{m['user'] or m['bot_id']}: {m['text']}",
+                          flush=True)
+                ws.close()
+            except Exception as e:  # noqa: BLE001
+                print(f"msgr listen: reconnecting ({e})", file=sys.stderr)
+                time.sleep(5)
 
 
 # ------------------------------------------------------------- Telegram
 
 class Telegram:
-    def __init__(self, cfg):
-        t = cfg.get("telegram", {})
-        self.api_id = int(t.get("api_id") or os.environ.get("TELEGRAM_API_ID") or 0)
-        self.api_hash = t.get("api_hash") or os.environ.get("TELEGRAM_API_HASH")
-        self.phone = t.get("phone") or os.environ.get("TELEGRAM_PHONE")
+    def __init__(self, env_name, env):
+        self.env_name = env_name
+        self.api_id = int(env.get("api_id") or 0)
+        self.api_hash = env.get("api_hash")
+        self.phone = env.get("phone")
         self.session = os.path.expanduser(
-            t.get("session", "~/.local/state/msgr/telegram.session"))
-        if not self.api_id or not self.api_hash or self.api_hash == "PLACEHOLDER":
-            die("telegram not configured (api_id/api_hash)")
+            env.get("session", f"~/.local/state/msgr/{env_name}.session"))
+        if not self.api_id or not self.api_hash:
+            die(f"environment '{env_name}': telegram api_id/api_hash not set")
 
-    def client(self):
+    @staticmethod
+    def _entity(kind, target):
+        if re.fullmatch(r"-?\d+", target):
+            return int(target)
+        return target if target.startswith("@") else "@" + target
+
+    def _client_cls(self):
         try:
             from telethon.sync import TelegramClient
         except ImportError:
-            die("telethon not installed (pip install telethon)")
+            die("telethon not installed (pip install 'msgr[telegram]')")
+        return TelegramClient
+
+    def client(self):
         pathlib.Path(self.session).parent.mkdir(parents=True, exist_ok=True)
-        c = TelegramClient(self.session, self.api_id, self.api_hash)
+        c = self._client_cls()(self.session, self.api_id, self.api_hash)
         c.connect()
         if not c.is_user_authorized():
-            die("telegram session not authorized — run: msgr tg-login")
+            die(f"telegram session not authorized — run: "
+                f"msgr tg-login {self.env_name}")
         return c
 
     def login(self):
-        try:
-            from telethon.sync import TelegramClient
-        except ImportError:
-            die("telethon not installed (pip install telethon)")
         pathlib.Path(self.session).parent.mkdir(parents=True, exist_ok=True)
-        with TelegramClient(self.session, self.api_id, self.api_hash) as c:
+        with self._client_cls()(self.session, self.api_id, self.api_hash) as c:
             c.start(phone=self.phone)
             me = c.get_me()
             print(f"logged in as {me.first_name} (@{me.username})")
 
-    def send(self, target, text, thread=None):
+    def send(self, kind, target, text, thread=None):
         with self.client() as c:
-            m = c.send_message(target, text)
+            m = c.send_message(self._entity(kind, target), text)
             return {"channel": target, "ts": str(m.id)}
 
-    def read(self, target, cursor=None, limit=100):
+    def read(self, kind, target, cursor=None, limit=100):
         with self.client() as c:
+            entity = self._entity(kind, target)
             min_id = int(cursor) if cursor else 0
-            kwargs = {"min_id": min_id} if min_id else {"limit": min(limit, 100)}
-            msgs = [m for m in c.get_messages(target, limit=min(limit, 500), **kwargs)]
-            msgs.reverse()  # oldest first
+            kwargs = {"min_id": min_id} if min_id else {}
+            msgs = list(c.get_messages(entity, limit=min(limit, 500), **kwargs))
+            msgs.reverse()
             out = []
             for m in msgs:
                 sender = getattr(m.sender, "username", None) \
                     or getattr(m.sender, "title", None) \
                     or getattr(m.chat, "title", None) or "?"
-                out.append({
-                    "platform": "tg", "channel": target, "ts": str(m.id),
-                    "thread": None, "from": sender, "text": m.text or "",
-                })
-            new_cursor = str(msgs[-1].id) if msgs else cursor
-            return out, new_cursor
-
-
-# ---------------------------------------------------------------- listen
-
-def listen(cfg, json_out):
-    """Socket Mode event stream: one line per message event, forever."""
-    token = (cfg.get("slack", {}).get("app_token")
-             or os.environ.get("SLACK_APP_TOKEN"))
-    if not token:
-        die("listen needs a Slack app-level token (slack.app_token / SLACK_APP_TOKEN)")
-    try:
-        import websocket
-    except ImportError:
-        die("websocket-client not installed (pip install 'msgr[listen]')")
-    import time
-
-    while True:
-        try:
-            req = urllib.request.Request(
-                "https://slack.com/api/apps.connections.open", data=b"",
-                headers={"Authorization": f"Bearer {token}"})
-            resp = json.load(urllib.request.urlopen(req, timeout=30))
-            if not resp.get("ok"):
-                die(f"apps.connections.open: {resp.get('error')}")
-            ws = websocket.create_connection(resp["url"], timeout=120)
-            while True:
-                try:
-                    raw = ws.recv()
-                except websocket.WebSocketTimeoutException:
-                    ws.ping()
-                    continue
-                env = json.loads(raw)
-                t = env.get("type")
-                if t == "disconnect":
-                    break
-                if env.get("envelope_id"):
-                    ws.send(json.dumps({"envelope_id": env["envelope_id"]}))
-                if t != "events_api":
-                    continue
-                ev = env.get("payload", {}).get("event", {})
-                if ev.get("type") != "message" or ev.get("subtype"):
-                    continue
-                m = {"platform": "slack", "channel": ev.get("channel"),
-                     "user": ev.get("user"), "bot_id": ev.get("bot_id"),
-                     "ts": ev.get("ts"), "thread": ev.get("thread_ts"),
-                     "text": ev.get("text", "")}
-                print(json.dumps(m, ensure_ascii=False) if json_out
-                      else f"[{m['ts']}] {m['channel']} {m['user'] or m['bot_id']}: {m['text']}",
-                      flush=True)
-            ws.close()
-        except (OSError, json.JSONDecodeError, Exception) as e:  # noqa: BLE001
-            print(f"msgr listen: reconnecting ({e})", file=sys.stderr)
-            time.sleep(5)
+                out.append({"env": self.env_name, "channel": target,
+                            "ts": str(m.id), "thread": None,
+                            "from": sender, "text": m.text or ""})
+            return out, (str(msgs[-1].id) if msgs else cursor)
 
 
 # ------------------------------------------------------------------ CLI
-
-def platform_client(cfg, plat):
-    return Slack(cfg) if plat == "slack" else Telegram(cfg)
-
 
 def fmt(m):
     return f"[{m['ts']}] {m['from']}: {m['text']}"
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="msgr", description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        prog="msgr", description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("send", help="send a message (text args or stdin)")
@@ -314,78 +360,82 @@ def main():
     p.add_argument("--limit", type=int, default=100)
     p.add_argument("--json", action="store_true", help="JSONL output")
 
-    p = sub.add_parser("channels", help="list Slack channels the bot is in")
-
     p = sub.add_parser("react", help="add a reaction emoji to a Slack message")
     p.add_argument("addr")
     p.add_argument("ts")
     p.add_argument("emoji")
 
-    p = sub.add_parser("listen", help="stream Slack messages (Socket Mode) as they arrive")
-    p.add_argument("--json", action="store_true", help="JSONL output (default: text)")
+    p = sub.add_parser("channels", help="list channels the bot can see")
+    p.add_argument("env", nargs="?")
 
-    p = sub.add_parser("tg-login", help="interactive one-time Telegram login")
+    p = sub.add_parser("listen", help="stream messages as they arrive (Slack)")
+    p.add_argument("env", nargs="?")
+    p.add_argument("--json", action="store_true", help="JSONL output")
+
+    p = sub.add_parser("tg-login", help="one-time interactive Telegram login")
+    p.add_argument("env", nargs="?")
 
     args = ap.parse_args()
     cfg = load_config()
 
     if args.cmd == "tg-login":
-        Telegram(cfg).login()
-        return
-
-    if args.cmd == "listen":
-        listen(cfg, args.json)
-        return
-
-    if args.cmd == "react":
-        plat, target = resolve_addr(cfg, args.addr)
-        if plat != "slack":
-            die("react is Slack-only")
-        Slack(cfg).react(target, args.ts, args.emoji)
+        name, env = pick_env(cfg, args.env)
+        if env.get("platform") != "telegram":
+            die(f"environment '{name}' is not telegram")
+        Telegram(name, env).login()
         return
 
     if args.cmd == "channels":
-        s = Slack(cfg)
-        chans, note = [], ""
-        try:
-            chans = s.api("users.conversations", _quiet=True,
-                          types="public_channel,private_channel",
-                          limit=200)["channels"]
-        except SystemExit:
-            chans = s.api("users.conversations", types="public_channel",
-                          limit=200)["channels"]
-            note = " (private channels hidden: app lacks groups:read; use aliases)"
-        for c in chans:
-            kind = "private" if c.get("is_private") else "public"
-            print(f"{c['id']}\t#{c['name']}\t{kind}")
-        for name, addr in cfg.get("aliases", {}).items():
-            print(f"{addr}\t{name}\talias")
+        name, env = pick_env(cfg, args.env)
+        client = platform_client(name, env)
+        if not isinstance(client, Slack):
+            die("channels is Slack-only for now")
+        chans, note = client.channels()
+        for cid, cname, kind in chans:
+            print(f"{cid}\t{cname}\t{kind}")
+        for alias, addr in cfg.get("aliases", {}).items():
+            print(f"{addr}\t{alias}\talias")
         if note:
             print(note, file=sys.stderr)
         return
 
-    plat, target = resolve_addr(cfg, args.addr)
-    client = platform_client(cfg, plat)
+    if args.cmd == "listen":
+        name, env = pick_env(cfg, args.env)
+        client = platform_client(name, env)
+        if not isinstance(client, Slack):
+            die("listen is Slack-only for now")
+        client.listen(args.json)
+        return
+
+    env_name, env, kind, target = resolve_addr(cfg, args.addr)
+    client = platform_client(env_name, env)
+
+    if args.cmd == "react":
+        if not isinstance(client, Slack):
+            die("react is Slack-only")
+        client.react(kind, target, args.ts, args.emoji)
+        return
 
     if args.cmd == "send":
         text = " ".join(args.text) if args.text else sys.stdin.read().strip()
         if not text:
             die("empty message")
-        r = client.send(target, text, thread=getattr(args, "thread", None))
-        print(f"sent to {plat}:{r['channel']} ts={r['ts']}")
+        r = client.send(kind, target, text, thread=args.thread)
+        print(f"sent to {env_name}{kind}{r['channel']} ts={r['ts']}")
         return
 
     if args.cmd == "read":
-        cursor = None if args.last else cursor_get(args.consumer, plat, target)
+        cursor = None if args.last \
+            else cursor_get(args.consumer, env_name, kind, target)
         limit = args.last or args.limit
         first_read = cursor is None and not args.last
-        msgs, new_cursor = client.read(target, cursor=cursor, limit=limit)
+        msgs, new_cursor = client.read(kind, target, cursor=cursor, limit=limit)
         if first_read:
             msgs = msgs[-20:]  # first contact: don't dump entire history
         for m in msgs:
             print(json.dumps(m, ensure_ascii=False) if args.json else fmt(m))
         if not args.peek and not args.last and new_cursor:
-            cursor_set(args.consumer, plat, target, new_cursor)
+            cursor_set(args.consumer, env_name, kind, target, new_cursor)
         return
 
 
