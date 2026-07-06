@@ -108,6 +108,22 @@ def cursor_set(consumer, env_name, kind, target, value):
     p.write_text(str(value))
 
 
+def name_cache_path(env_name, name):
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    return STATE_DIR / "names" / f"{env_name}#{safe}"
+
+
+def name_cache_get(env_name, name):
+    p = name_cache_path(env_name, name)
+    return p.read_text().strip() if p.exists() else None
+
+
+def name_cache_set(env_name, name, cid):
+    p = name_cache_path(env_name, name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(cid)
+
+
 # ---------------------------------------------------------------- Slack
 
 class Slack:
@@ -155,6 +171,9 @@ class Slack:
         if re.fullmatch(r"[CGD][A-Z0-9]{8,}", target):
             return target
         name = target.lstrip("#")
+        cached = name_cache_get(self.env_name, name)
+        if cached:
+            return cached
         for types in ("public_channel,private_channel", "public_channel"):
             cursor, ok = "", True
             while True:
@@ -205,6 +224,8 @@ class Slack:
         if thread:
             params["thread_ts"] = thread
         resp = self.api("chat.postMessage", **params)
+        if kind == "#" and not re.fullmatch(r"[CGD][A-Z0-9]{8,}", target):
+            name_cache_set(self.env_name, target.lstrip("#"), resp["channel"])
         return {"channel": resp["channel"], "ts": resp["ts"]}
 
     def read(self, kind, target, cursor=None, limit=100):
