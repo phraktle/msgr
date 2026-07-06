@@ -74,6 +74,20 @@ alerts = "work#C0123456789"    # private Slack channels: use the ID
 daily = "news@daily_updates"
 ```
 
+## Posting is opt-in
+
+Environments are **quiet by default**: `read`/`listen` always work, but
+`send`, `react`, and uploads are refused until the environment is armed:
+
+```toml
+[envs.work]
+allow_post = true                      # whole environment writable
+[envs.news]
+# no allow_post -> pure notetaker: can read, can never post
+[envs.other]
+allow_post = ["#ops", "@alice"]        # only these addresses
+```
+
 ## Notes
 
 - **Slack**: the bot must be a member of channels it reads or posts to.
