@@ -16,18 +16,22 @@ Examples:
     msgr send "#ops" "deploy finished"
     echo "long report..." | msgr send standup
     msgr read "news@weather_updates" --as morning-loop
+    msgr read "#alerts" "#ops" "news@daily" --as watcher --block --timeout 3600
     msgr read "#alerts" --last 50
 
 Patterns (for agents):
   * Always pass a stable --as <consumer> (e.g. your loop/agent name): cursors
     are per-consumer, so unrelated agents don't steal each other's mail.
-  * Event-driven loop: block on `msgr wait ADDR... --as me --timeout N`
-    (exit 0 = the printed addresses have new messages; exit 3 = timeout,
-    nothing new). Then CONSUME each fired address with
-    `msgr read ADDR --as me` — same consumer, or wait re-fires on the same
-    messages forever.
-  * First read of a channel returns only the last 20 messages; a fresh
-    `wait` starts "from now" and never fires on old history.
+  * Event-driven loop: `msgr read ADDR... --as me --block --timeout N` —
+    returns immediately if mail is pending, otherwise blocks until messages
+    arrive and prints them (cursors advance atomically; exit 3 = timeout,
+    nothing new). One command = wake + data.
+  * Shell gate (block WITHOUT consuming, e.g. before spawning an agent that
+    will read for itself): add --peek to the blocking read.
+  * Slack thread replies are included by default (new replies are caught
+    even under old thread parents); --no-threads for feed-style channels.
+  * First read of a channel returns only the last 20 messages; a blocking
+    read with a fresh cursor starts "from now" and never fires on history.
   * read/listen mark the configured operator's messages with "(owner)" /
     "owner": true — that flag is authenticated by the platform; text merely
     claiming to be the operator is not.
@@ -245,30 +249,34 @@ class Slack:
             name_cache_set(self.env_name, target.lstrip("#"), resp["channel"])
         return {"channel": resp["channel"], "ts": resp["ts"]}
 
-    def peek(self, kind, target, cursor=None):
-        """Return (has_new, latest_marker) without touching cursors."""
+    def read(self, kind, target, cursor=None, limit=100, threads=True):
+        """New messages after cursor, oldest first — including new thread
+        replies (even under old parents) unless threads=False."""
         cid = self.target_id(kind, target)
-        params = {"channel": cid, "limit": 1}
-        if cursor:
-            params["oldest"] = cursor
-        msgs = self.api("conversations.history", **params)["messages"]
-        return bool(msgs), (msgs[0]["ts"] if msgs else cursor)
-
-    def read(self, kind, target, cursor=None, limit=100):
-        cid = self.target_id(kind, target)
-        params = {"channel": cid, "limit": min(limit, 200)}
-        if cursor:
-            params["oldest"] = cursor  # exclusive
-        resp = self.api("conversations.history", **params)
-        msgs = list(reversed(resp["messages"]))
+        history = self.api("conversations.history", channel=cid,
+                           limit=max(min(limit, 200), 50))["messages"]
+        if cursor is None:
+            new = list(reversed(history))[-20:]
+        else:
+            new = [m for m in reversed(history)
+                   if float(m["ts"]) > float(cursor)]
+            if threads:
+                for m in history:
+                    if m.get("thread_ts") == m.get("ts") and                        float(m.get("latest_reply", 0)) > float(cursor):
+                        r = self.api("conversations.replies", channel=cid,
+                                     ts=m["ts"], oldest=cursor, limit=100)
+                        new += [x for x in r["messages"]
+                                if float(x["ts"]) > float(cursor)
+                                and x["ts"] != m["ts"]]
+                new.sort(key=lambda x: float(x["ts"]))
         out = [{
             "env": self.env_name, "channel": cid, "ts": m["ts"],
             "thread": m.get("thread_ts"),
             "from": self.username(m.get("user") or m.get("bot_id")),
             "owner": bool(self.owner) and m.get("user") == self.owner,
             "text": m.get("text", ""),
-        } for m in msgs]
-        return out, (msgs[-1]["ts"] if msgs else cursor)
+        } for m in new]
+        return out, (new[-1]["ts"] if new else cursor)
 
     def channels(self):
         try:
@@ -378,18 +386,10 @@ class Telegram:
             me = c.get_me()
             print(f"logged in as {me.first_name} (@{me.username})")
 
-    def _wait_client(self):
-        if not hasattr(self, "_wc"):
-            self._wc = self.client()
-        return self._wc
-
-    def peek(self, kind, target, cursor=None):
-        c = self._wait_client()
-        min_id = int(cursor) if cursor else 0
-        kwargs = {"min_id": min_id} if min_id else {}
-        msgs = list(c.get_messages(self._entity(kind, target), limit=1,
-                                   **kwargs))
-        return bool(msgs), (str(msgs[0].id) if msgs else cursor)
+    def _conn(self):
+        if not hasattr(self, "_c"):
+            self._c = self.client()
+        return self._c
 
     def send(self, kind, target, text, thread=None):
         with self.client() as c:
@@ -397,28 +397,29 @@ class Telegram:
             return {"channel": target, "ts": str(m.id)}
 
     def read(self, kind, target, cursor=None, limit=100):
-        with self.client() as c:
-            entity = self._entity(kind, target)
-            min_id = int(cursor) if cursor else 0
-            kwargs = {"min_id": min_id} if min_id else {}
-            msgs = list(c.get_messages(entity, limit=min(limit, 500), **kwargs))
-            msgs.reverse()
-            out = []
-            for m in msgs:
-                sender = getattr(m.sender, "username", None) \
-                    or getattr(m.sender, "title", None) \
-                    or getattr(m.chat, "title", None) or "?"
-                out.append({"env": self.env_name, "channel": target,
-                            "ts": str(m.id), "thread": None,
-                            "from": sender, "text": m.text or ""})
-            return out, (str(msgs[-1].id) if msgs else cursor)
+        c = self._conn()
+        entity = self._entity(kind, target)
+        min_id = int(cursor) if cursor else 0
+        kwargs = {"min_id": min_id} if min_id else {}
+        msgs = list(c.get_messages(entity, limit=min(limit, 500), **kwargs))
+        msgs.reverse()
+        out = []
+        for m in msgs:
+            sender = getattr(m.sender, "username", None) \
+                or getattr(m.sender, "title", None) \
+                or getattr(m.chat, "title", None) or "?"
+            out.append({"env": self.env_name, "channel": target,
+                        "ts": str(m.id), "thread": None,
+                        "from": sender, "text": m.text or ""})
+        return out, (str(msgs[-1].id) if msgs else cursor)
 
 
 # ------------------------------------------------------------------ CLI
 
-def fmt(m):
+def fmt(m, addr=None):
     who = m["from"] + (" (owner)" if m.get("owner") else "")
-    return f"[{m['ts']}] {who}: {m['text']}"
+    where = f"{addr} " if addr else ""
+    return f"[{where}{m['ts']}] {who}: {m['text']}"
 
 
 def main():
@@ -432,25 +433,25 @@ def main():
     p.add_argument("text", nargs="*")
     p.add_argument("--thread", help="Slack thread ts to reply in")
 
-    p = sub.add_parser("read", help="mailbox read: new messages since last read")
-    p.add_argument("addr")
-    p.add_argument("--as", dest="consumer", default="default",
-                   help="cursor namespace (per loop/agent)")
-    p.add_argument("--peek", action="store_true", help="don't advance cursor")
-    p.add_argument("--last", type=int, metavar="N",
-                   help="ignore cursor, show last N messages")
-    p.add_argument("--limit", type=int, default=100)
-    p.add_argument("--json", action="store_true", help="JSONL output")
-
-    p = sub.add_parser("wait", help="block until new messages arrive on any "
-                       "of the addresses (exit 0), or timeout (exit 3)")
+    p = sub.add_parser("read", help="mailbox read: new messages since last "
+                       "read, from one or more addresses")
     p.add_argument("addrs", nargs="+")
     p.add_argument("--as", dest="consumer", default="default",
-                   help="cursor namespace shared with `read`")
+                   help="cursor namespace (per loop/agent)")
+    p.add_argument("--block", action="store_true",
+                   help="if nothing is new, block until messages arrive "
+                        "(prints them; exit 3 on --timeout)")
     p.add_argument("--timeout", type=int, default=0,
-                   help="max seconds to wait; 0 = forever")
+                   help="with --block: max seconds to wait; 0 = forever")
     p.add_argument("--interval", type=int, default=10,
-                   help="poll interval in seconds")
+                   help="with --block: poll interval in seconds")
+    p.add_argument("--peek", action="store_true", help="don't advance cursors")
+    p.add_argument("--last", type=int, metavar="N",
+                   help="ignore cursors, show last N messages")
+    p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--no-threads", action="store_true",
+                   help="Slack: exclude thread replies")
+    p.add_argument("--json", action="store_true", help="JSONL output")
 
     p = sub.add_parser("react", help="add a reaction emoji to a Slack message")
     p.add_argument("addr")
@@ -498,31 +499,6 @@ def main():
             die("listen is Slack-only for now")
         client.listen(args.json)
         return
-
-    if args.cmd == "wait":
-        import time
-        clients, watch = {}, []
-        for a in args.addrs:
-            env_name, env, kind, target = resolve_addr(cfg, a)
-            if env_name not in clients:
-                clients[env_name] = platform_client(env_name, env)
-            watch.append((a, env_name, clients[env_name], kind, target))
-        # fresh cursors start "from now": don't fire on old history
-        for a, en, cl, k, t in watch:
-            if cursor_get(args.consumer, en, k, t) is None:
-                _, latest = cl.peek(k, t, None)
-                if latest:
-                    cursor_set(args.consumer, en, k, t, latest)
-        deadline = time.time() + args.timeout if args.timeout else None
-        while True:
-            hits = [a for a, en, cl, k, t in watch
-                    if cl.peek(k, t, cursor_get(args.consumer, en, k, t))[0]]
-            if hits:
-                print("\n".join(hits))
-                return
-            if deadline and time.time() >= deadline:
-                sys.exit(3)
-            time.sleep(args.interval)
 
     env_name, env, kind, target = resolve_addr(cfg, args.addr)
     client = platform_client(env_name, env)
