@@ -100,7 +100,7 @@ class Slack:
             die("no Slack bot token (config slack.bot_token or SLACK_BOT_TOKEN)")
         self._users = {}
 
-    def api(self, method, **params):
+    def api(self, method, _quiet=False, **params):
         data = urllib.parse.urlencode(params).encode()
         req = urllib.request.Request(
             f"https://slack.com/api/{method}", data=data,
@@ -108,6 +108,8 @@ class Slack:
         with urllib.request.urlopen(req, timeout=30) as r:
             resp = json.load(r)
         if not resp.get("ok"):
+            if _quiet:
+                raise SystemExit(1)
             die(f"slack {method}: {resp.get('error')}")
         return resp
 
@@ -139,6 +141,10 @@ class Slack:
             except SystemExit:
                 self._users[uid] = uid
         return self._users[uid]
+
+    def react(self, target, ts, emoji):
+        cid = self.resolve_channel(target)
+        self.api("reactions.add", channel=cid, timestamp=ts, name=emoji.strip(":"))
 
     def send(self, target, text, thread=None):
         params = {"channel": target, "text": text}
@@ -225,6 +231,59 @@ class Telegram:
             return out, new_cursor
 
 
+# ---------------------------------------------------------------- listen
+
+def listen(cfg, json_out):
+    """Socket Mode event stream: one line per message event, forever."""
+    token = (cfg.get("slack", {}).get("app_token")
+             or os.environ.get("SLACK_APP_TOKEN"))
+    if not token:
+        die("listen needs a Slack app-level token (slack.app_token / SLACK_APP_TOKEN)")
+    try:
+        import websocket
+    except ImportError:
+        die("websocket-client not installed (pip install 'msgr[listen]')")
+    import time
+
+    while True:
+        try:
+            req = urllib.request.Request(
+                "https://slack.com/api/apps.connections.open", data=b"",
+                headers={"Authorization": f"Bearer {token}"})
+            resp = json.load(urllib.request.urlopen(req, timeout=30))
+            if not resp.get("ok"):
+                die(f"apps.connections.open: {resp.get('error')}")
+            ws = websocket.create_connection(resp["url"], timeout=120)
+            while True:
+                try:
+                    raw = ws.recv()
+                except websocket.WebSocketTimeoutException:
+                    ws.ping()
+                    continue
+                env = json.loads(raw)
+                t = env.get("type")
+                if t == "disconnect":
+                    break
+                if env.get("envelope_id"):
+                    ws.send(json.dumps({"envelope_id": env["envelope_id"]}))
+                if t != "events_api":
+                    continue
+                ev = env.get("payload", {}).get("event", {})
+                if ev.get("type") != "message" or ev.get("subtype"):
+                    continue
+                m = {"platform": "slack", "channel": ev.get("channel"),
+                     "user": ev.get("user"), "bot_id": ev.get("bot_id"),
+                     "ts": ev.get("ts"), "thread": ev.get("thread_ts"),
+                     "text": ev.get("text", "")}
+                print(json.dumps(m, ensure_ascii=False) if json_out
+                      else f"[{m['ts']}] {m['channel']} {m['user'] or m['bot_id']}: {m['text']}",
+                      flush=True)
+            ws.close()
+        except (OSError, json.JSONDecodeError, Exception) as e:  # noqa: BLE001
+            print(f"msgr listen: reconnecting ({e})", file=sys.stderr)
+            time.sleep(5)
+
+
 # ------------------------------------------------------------------ CLI
 
 def platform_client(cfg, plat):
@@ -257,6 +316,14 @@ def main():
 
     p = sub.add_parser("channels", help="list Slack channels the bot is in")
 
+    p = sub.add_parser("react", help="add a reaction emoji to a Slack message")
+    p.add_argument("addr")
+    p.add_argument("ts")
+    p.add_argument("emoji")
+
+    p = sub.add_parser("listen", help="stream Slack messages (Socket Mode) as they arrive")
+    p.add_argument("--json", action="store_true", help="JSONL output (default: text)")
+
     p = sub.add_parser("tg-login", help="interactive one-time Telegram login")
 
     args = ap.parse_args()
@@ -266,11 +333,22 @@ def main():
         Telegram(cfg).login()
         return
 
+    if args.cmd == "listen":
+        listen(cfg, args.json)
+        return
+
+    if args.cmd == "react":
+        plat, target = resolve_addr(cfg, args.addr)
+        if plat != "slack":
+            die("react is Slack-only")
+        Slack(cfg).react(target, args.ts, args.emoji)
+        return
+
     if args.cmd == "channels":
         s = Slack(cfg)
         chans, note = [], ""
         try:
-            chans = s.api("users.conversations",
+            chans = s.api("users.conversations", _quiet=True,
                           types="public_channel,private_channel",
                           limit=200)["channels"]
         except SystemExit:

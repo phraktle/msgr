@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 
 [project.optional-dependencies]
 telegram = ["telethon>=1.36"]
+listen = ["websocket-client>=1.7"]
 
 [project.scripts]
 msgr = "msgr:main"
