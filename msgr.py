@@ -268,11 +268,22 @@ def main():
 
     if args.cmd == "channels":
         s = Slack(cfg)
-        resp = s.api("users.conversations", types="public_channel,private_channel",
-                     limit=200)
-        for c in resp["channels"]:
+        chans, note = [], ""
+        try:
+            chans = s.api("users.conversations",
+                          types="public_channel,private_channel",
+                          limit=200)["channels"]
+        except SystemExit:
+            chans = s.api("users.conversations", types="public_channel",
+                          limit=200)["channels"]
+            note = " (private channels hidden: app lacks groups:read; use aliases)"
+        for c in chans:
             kind = "private" if c.get("is_private") else "public"
             print(f"{c['id']}\t#{c['name']}\t{kind}")
+        for name, addr in cfg.get("aliases", {}).items():
+            print(f"{addr}\t{name}\talias")
+        if note:
+            print(note, file=sys.stderr)
         return
 
     plat, target = resolve_addr(cfg, args.addr)
