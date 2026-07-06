@@ -115,6 +115,7 @@ class Slack:
         self.env_name = env_name
         self.token = env.get("bot_token")
         self.app_token = env.get("app_token")
+        self.owner = env.get("owner")
         if not self.token:
             die(f"environment '{env_name}': no bot_token")
         self._users = {}
@@ -200,6 +201,7 @@ class Slack:
             "env": self.env_name, "channel": cid, "ts": m["ts"],
             "thread": m.get("thread_ts"),
             "from": self.username(m.get("user") or m.get("bot_id")),
+            "owner": bool(self.owner) and m.get("user") == self.owner,
             "text": m.get("text", ""),
         } for m in msgs]
         return out, (msgs[-1]["ts"] if msgs else cursor)
@@ -256,6 +258,8 @@ class Slack:
                         continue
                     m = {"env": self.env_name, "channel": ev.get("channel"),
                          "user": ev.get("user"), "bot_id": ev.get("bot_id"),
+                         "owner": bool(self.owner)
+                         and ev.get("user") == self.owner,
                          "ts": ev.get("ts"), "thread": ev.get("thread_ts"),
                          "text": ev.get("text", "")}
                     print(json.dumps(m, ensure_ascii=False) if json_out
@@ -336,7 +340,8 @@ class Telegram:
 # ------------------------------------------------------------------ CLI
 
 def fmt(m):
-    return f"[{m['ts']}] {m['from']}: {m['text']}"
+    who = m["from"] + (" (owner)" if m.get("owner") else "")
+    return f"[{m['ts']}] {who}: {m['text']}"
 
 
 def main():

@@ -48,7 +48,10 @@ default_env = "work"
 platform = "slack"
 bot_token = "xoxb-..."
 app_token = "xapp-..."      # only needed for `listen` (Socket Mode)
-owner = "U0123456789"       # optional: the operator's user ID, for drivers
+owner = "U0123456789"       # optional: the operator's user ID — their
+                            # messages get an authenticated "(owner)" mark
+                            # in read/listen output, so agents can tell the
+                            # operator apart from anyone merely claiming to be
 
 [envs.family]
 platform = "slack"
