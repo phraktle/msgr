@@ -19,12 +19,12 @@ Examples:
     msgr read "news@weather_updates" --as morning-loop
     msgr read "#alerts" "#ops" "news@daily" --as watcher --block --timeout 3600
     msgr read "#alerts" --last 50
-    msgr read "@" "#alerts" --as me --block      # poll own DMs + a channel
+    msgr read "@" "#alerts" --as my-agent --block   # poll own DMs + a channel
 
 Patterns (for agents):
   * Always pass a stable --as <consumer> (e.g. your loop/agent name): cursors
     are per-consumer, so unrelated agents don't steal each other's mail.
-  * Event-driven loop: `msgr read ADDR... --as me --block --timeout N` —
+  * Event-driven loop: `msgr read ADDR... --as <agent-name> --block --timeout N` —
     returns immediately if mail is pending, otherwise blocks until messages
     arrive and prints them (cursors advance atomically; exit 3 = timeout,
     nothing new). One command = wake + data.
