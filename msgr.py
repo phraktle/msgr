@@ -154,17 +154,29 @@ class Slack:
             return self.api("conversations.open", users=uid)["channel"]["id"]
         if re.fullmatch(r"[CGD][A-Z0-9]{8,}", target):
             return target
-        name, cursor = target.lstrip("#"), ""
-        while True:
-            resp = self.api("conversations.list", types="public_channel",
-                            limit=999, cursor=cursor)
-            for c in resp["channels"]:
-                if c["name"] == name:
-                    return c["id"]
-            cursor = resp.get("response_metadata", {}).get("next_cursor", "")
-            if not cursor:
-                die(f"channel #{name} not found — private channels need an ID "
-                    f"or an alias (or grant the app groups:read)")
+        name = target.lstrip("#")
+        for types in ("public_channel,private_channel", "public_channel"):
+            cursor, ok = "", True
+            while True:
+                try:
+                    resp = self.api("conversations.list", _quiet=True,
+                                    types=types, limit=999, cursor=cursor)
+                except SystemExit:
+                    ok = False
+                    break
+                for c in resp["channels"]:
+                    if c["name"] == name:
+                        return c["id"]
+                cursor = resp.get("response_metadata", {}) \
+                    .get("next_cursor", "")
+                if not cursor:
+                    break
+            if ok:
+                break
+        die(f"channel #{name} not found by name — for private channels use "
+            f"the channel ID or an alias, or grant the app the groups:read "
+            f"scope (sending by #name works regardless if the bot is a "
+            f"member)")
 
     def username(self, uid):
         if not uid:
@@ -184,7 +196,12 @@ class Slack:
                  name=emoji.strip(":"))
 
     def send(self, kind, target, text, thread=None):
-        params = {"channel": self.target_id(kind, target), "text": text}
+        # chat.postMessage resolves #names itself for channels the bot is in
+        # (including private ones) — only resolve when it's a person.
+        chan = self.target_id(kind, target) if kind == "@" else \
+            (target if target.startswith("#")
+             or re.fullmatch(r"[CGD][A-Z0-9]{8,}", target) else "#" + target)
+        params = {"channel": chan, "text": text}
         if thread:
             params["thread_ts"] = thread
         resp = self.api("chat.postMessage", **params)
