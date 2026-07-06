@@ -17,6 +17,10 @@ msgr read "#alerts" --last 50                   # plain history, no cursor
 msgr read "#alerts" --peek                      # look without consuming
 msgr read "#alerts" --json                      # JSONL for scripts
 msgr send "work@alice" "lunch?"                 # direct message
+msgr wait "#alerts" "news@daily_updates" --as watcher --timeout 3600
+                                                # block until any address has
+                                                # new messages (exit 0, prints
+                                                # which) or timeout (exit 3)
 msgr channels                                   # what the bot can see
 msgr listen --json                              # stream messages (Socket Mode)
 msgr react "#ops" 1712345678.123 white_check_mark
@@ -83,6 +87,13 @@ daily = "news@daily_updates"
 - **Telegram**: uses a user-account MTProto session (Telethon). Run
   `msgr tg-login <env>` once interactively; after that reads/sends are
   one-shot. The session file is as sensitive as being logged in — guard it.
+- **`wait`** is the long-poll gate for agent loops: it blocks (polling
+  cheaply, no LLM anywhere) until one of the watched addresses has messages
+  newer than the consumer's cursor, prints the addresses that fired, and
+  exits — so an expensive agent only spawns when there is actually something
+  to process. A fresh cursor starts "from now" (wait won't fire on old
+  history). Use the same `--as` consumer in the follow-up `read` so it
+  consumes exactly what `wait` detected.
 - **Cursors** live in `~/.local/state/msgr/cursors/`, one per
   `(consumer, environment, channel)`. First read of a channel returns only
   the last 20 messages rather than all history.
