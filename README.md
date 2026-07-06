@@ -95,6 +95,11 @@ daily = "news@daily_updates"
   block without consuming (shell-gate pattern: a supervisor blocks, then
   spawns an agent that reads for itself). Slack thread replies are included
   by default; `--no-threads` to exclude.
+- **Attachments**: `read` downloads files (≤20 MB) to
+  `~/.local/state/msgr/files/` and appends `[attachment: /path]` to the
+  message — point your agent's file-reading tool at the path to view images.
+  `--no-files` skips downloads. Slack needs the `files:read` scope; without
+  it you get a `files_note` naming the undownloadable attachments.
 - **Cursors** live in `~/.local/state/msgr/cursors/`, one per
   `(consumer, environment, channel)`. First read of a channel returns only
   the last 20 messages rather than all history.
