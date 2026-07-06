@@ -228,6 +228,15 @@ class Slack:
             name_cache_set(self.env_name, target.lstrip("#"), resp["channel"])
         return {"channel": resp["channel"], "ts": resp["ts"]}
 
+    def peek(self, kind, target, cursor=None):
+        """Return (has_new, latest_marker) without touching cursors."""
+        cid = self.target_id(kind, target)
+        params = {"channel": cid, "limit": 1}
+        if cursor:
+            params["oldest"] = cursor
+        msgs = self.api("conversations.history", **params)["messages"]
+        return bool(msgs), (msgs[0]["ts"] if msgs else cursor)
+
     def read(self, kind, target, cursor=None, limit=100):
         cid = self.target_id(kind, target)
         params = {"channel": cid, "limit": min(limit, 200)}
@@ -352,6 +361,19 @@ class Telegram:
             me = c.get_me()
             print(f"logged in as {me.first_name} (@{me.username})")
 
+    def _wait_client(self):
+        if not hasattr(self, "_wc"):
+            self._wc = self.client()
+        return self._wc
+
+    def peek(self, kind, target, cursor=None):
+        c = self._wait_client()
+        min_id = int(cursor) if cursor else 0
+        kwargs = {"min_id": min_id} if min_id else {}
+        msgs = list(c.get_messages(self._entity(kind, target), limit=1,
+                                   **kwargs))
+        return bool(msgs), (str(msgs[0].id) if msgs else cursor)
+
     def send(self, kind, target, text, thread=None):
         with self.client() as c:
             m = c.send_message(self._entity(kind, target), text)
@@ -403,6 +425,16 @@ def main():
     p.add_argument("--limit", type=int, default=100)
     p.add_argument("--json", action="store_true", help="JSONL output")
 
+    p = sub.add_parser("wait", help="block until new messages arrive on any "
+                       "of the addresses (exit 0), or timeout (exit 3)")
+    p.add_argument("addrs", nargs="+")
+    p.add_argument("--as", dest="consumer", default="default",
+                   help="cursor namespace shared with `read`")
+    p.add_argument("--timeout", type=int, default=0,
+                   help="max seconds to wait; 0 = forever")
+    p.add_argument("--interval", type=int, default=10,
+                   help="poll interval in seconds")
+
     p = sub.add_parser("react", help="add a reaction emoji to a Slack message")
     p.add_argument("addr")
     p.add_argument("ts")
@@ -449,6 +481,31 @@ def main():
             die("listen is Slack-only for now")
         client.listen(args.json)
         return
+
+    if args.cmd == "wait":
+        import time
+        clients, watch = {}, []
+        for a in args.addrs:
+            env_name, env, kind, target = resolve_addr(cfg, a)
+            if env_name not in clients:
+                clients[env_name] = platform_client(env_name, env)
+            watch.append((a, env_name, clients[env_name], kind, target))
+        # fresh cursors start "from now": don't fire on old history
+        for a, en, cl, k, t in watch:
+            if cursor_get(args.consumer, en, k, t) is None:
+                _, latest = cl.peek(k, t, None)
+                if latest:
+                    cursor_set(args.consumer, en, k, t, latest)
+        deadline = time.time() + args.timeout if args.timeout else None
+        while True:
+            hits = [a for a, en, cl, k, t in watch
+                    if cl.peek(k, t, cursor_get(args.consumer, en, k, t))[0]]
+            if hits:
+                print("\n".join(hits))
+                return
+            if deadline and time.time() >= deadline:
+                sys.exit(3)
+            time.sleep(args.interval)
 
     env_name, env, kind, target = resolve_addr(cfg, args.addr)
     client = platform_client(env_name, env)
