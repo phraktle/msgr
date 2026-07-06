@@ -24,6 +24,10 @@ Examples:
 Patterns (for agents):
   * Always pass a stable --as <consumer> (e.g. your loop/agent name): cursors
     are per-consumer, so unrelated agents don't steal each other's mail.
+    $MSGR_AS sets the default consumer. Recurring jobs need a DURABLE name
+    (an ephemeral one re-receives the same messages every run); a
+    conversation-scoped view is the one case where an ephemeral consumer is
+    right (e.g. export MSGR_AS=$CLAUDE_CODE_SESSION_ID in an agent session).
   * Event-driven loop: `msgr read ADDR... --as <agent-name> --block --timeout N` —
     returns immediately if mail is pending, otherwise blocks until messages
     arrive and prints them (cursors advance atomically; exit 3 = timeout,
@@ -508,8 +512,9 @@ def main():
     p = sub.add_parser("read", help="mailbox read: new messages since last "
                        "read, from one or more addresses")
     p.add_argument("addrs", nargs="+")
-    p.add_argument("--as", dest="consumer", default="default",
-                   help="cursor namespace (per loop/agent)")
+    p.add_argument("--as", dest="consumer", default=None,
+                   help="cursor namespace (per loop/agent); default: "
+                        "$MSGR_AS, else 'default'")
     p.add_argument("--block", action="store_true",
                    help="if nothing is new, block until messages arrive "
                         "(prints them; exit 3 on --timeout)")
@@ -543,6 +548,8 @@ def main():
     p.add_argument("env", nargs="?")
 
     args = ap.parse_args()
+    if getattr(args, "consumer", "x") is None:
+        args.consumer = os.environ.get("MSGR_AS") or "default"
     cfg = load_config()
 
     if args.cmd == "tg-login":
