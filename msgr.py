@@ -291,6 +291,24 @@ class Slack:
         dest.write_bytes(data)
         return str(dest)
 
+    def send_file(self, kind, target, path, text=None, thread=None):
+        cid = self.target_id(kind, target)
+        name = os.path.basename(path)
+        data = open(path, "rb").read()
+        up = self.api("files.getUploadURLExternal", filename=name,
+                      length=len(data))
+        req = urllib.request.Request(up["upload_url"], data=data,
+                                     method="POST")
+        urllib.request.urlopen(req, timeout=120).read()
+        params = {"channel_id": cid,
+                  "files": json.dumps([{"id": up["file_id"], "title": name}])}
+        if text:
+            params["initial_comment"] = text
+        if thread:
+            params["thread_ts"] = thread
+        self.api("files.completeUploadExternal", **params)
+        return {"channel": cid, "ts": "(file)"}
+
     def read(self, kind, target, cursor=None, limit=100, threads=True,
              files=True):
         """New messages after cursor, oldest first — including new thread
@@ -453,6 +471,12 @@ class Telegram:
             m = c.send_message(self._entity(kind, target), text)
             return {"channel": target, "ts": str(m.id)}
 
+    def send_file(self, kind, target, path, text=None, thread=None):
+        with self.client() as c:
+            m = c.send_file(self._entity(kind, target), path,
+                            caption=text or None)
+            return {"channel": target, "ts": str(m.id)}
+
     def read(self, kind, target, cursor=None, limit=100, files=True):
         c = self._conn()
         entity = self._entity(kind, target)
@@ -508,6 +532,8 @@ def main():
     p.add_argument("addr")
     p.add_argument("text", nargs="*")
     p.add_argument("--thread", help="Slack thread ts to reply in")
+    p.add_argument("--file", dest="files", action="append", metavar="PATH",
+                   help="upload a file (repeatable); text becomes the comment/caption")
 
     p = sub.add_parser("read", help="mailbox read: new messages since last "
                        "read, from one or more addresses")
@@ -589,7 +615,17 @@ def main():
                 die("react is Slack-only")
             client.react(kind, target, args.ts, args.emoji)
             return
-        text = " ".join(args.text) if args.text else sys.stdin.read().strip()
+        text = " ".join(args.text) if args.text \
+            else ("" if getattr(args, "files", None) else sys.stdin.read().strip())
+        if getattr(args, "files", None):
+            for i, path in enumerate(args.files):
+                if not os.path.isfile(path):
+                    die(f"no such file: {path}")
+                r = client.send_file(kind, target, path,
+                                     text=text if i == 0 else None,
+                                     thread=args.thread)
+                print(f"uploaded {path} to {env_name}{kind}{r['channel']}")
+            return
         if not text:
             die("empty message")
         r = client.send(kind, target, text, thread=args.thread)
