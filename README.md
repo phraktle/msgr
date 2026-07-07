@@ -6,14 +6,15 @@ built for LLM agents and shell scripts.
 The core idea: an agent shouldn't manage timestamps or connections. `read` is
 a mailbox — it prints only what's new since that consumer's last read and
 advances a cursor. `send` posts. Everything is a one-shot command; no daemon
-required.
+required. `read`/`listen` emit **JSONL by default** (structured, reliable for
+agents & scripts); add `--text` for human-readable output.
 
 ```bash
 msgr send "#ops" "deploy finished"
 echo "long report..." | msgr send standup       # alias from config
 msgr read "news:@daily_updates"                  # only new posts since last read
 msgr read "#alerts" --as pnl-loop               # independent cursor per agent
-msgr read "#alerts" --last 50                   # plain history, no cursor
+msgr read "#alerts" --last 50 --text            # human-readable (ISO time)
 msgr read "#alerts" --peek                      # look without consuming
 msgr read "#alerts" --json                      # JSONL for scripts
 msgr send "work:@alice" "lunch?"                 # direct message
@@ -132,6 +133,10 @@ allow_post = ["#ops", "@alice"]        # only these addresses
   message — point your agent's file-reading tool at the path to view images.
   `--no-files` skips downloads. Slack needs the `files:read` scope; without
   it you get a `files_note` naming the undownloadable attachments.
+- **Message fields**: each message carries `ts` (the platform message ID —
+  pass it verbatim to `--thread`/`react`; Slack's is an epoch-like key,
+  Telegram's is the integer id) and `time` (ISO8601 UTC, human/LLM readable).
+  Reformat `time`, never `ts`.
 - **Cursors** live in `~/.local/state/msgr/cursors/`, one per
   `(consumer, account, channel)`. First read of a channel returns only
   the last 20 messages rather than all history.
