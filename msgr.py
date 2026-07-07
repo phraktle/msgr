@@ -417,9 +417,12 @@ class Slack:
         out = []
         for m in new:
             entry = {
-                "env": self.env_name, "channel": cid, "ts": m["ts"],
-                "time": iso(m["ts"]), "thread": m.get("thread_ts"),
+                "account": self.env_name, "channel": cid,
+                "addr": f"{self.env_name}:{cid}",
+                "id": m["ts"], "time": iso(m["ts"]),
+                "thread": m.get("thread_ts"),
                 "from": self.username(m.get("user") or m.get("bot_id")),
+                "user": m.get("user") or m.get("bot_id"),
                 "owner": bool(self.owner) and m.get("user") == self.owner,
                 "text": m.get("text", ""),
             }
@@ -492,16 +495,19 @@ class Slack:
                         continue
                     if only is not None and ev.get("channel") not in only:
                         continue
-                    m = {"env": self.env_name, "channel": ev.get("channel"),
-                         "user": ev.get("user"), "bot_id": ev.get("bot_id"),
+                    uid = ev.get("user") or ev.get("bot_id")
+                    ch = ev.get("channel")
+                    m = {"account": self.env_name, "channel": ch,
+                         "addr": f"{self.env_name}:{ch}",
+                         "id": ev.get("ts"), "time": iso(ev.get("ts")),
+                         "thread": ev.get("thread_ts"),
+                         "from": self.username(uid), "user": uid,
                          "owner": bool(self.owner)
                          and ev.get("user") == self.owner,
-                         "ts": ev.get("ts"), "time": iso(ev.get("ts")),
-                         "thread": ev.get("thread_ts"),
                          "text": ev.get("text", "")}
                     print(json.dumps(m, ensure_ascii=False) if not text_out
                           else f"[{m['time']}] {m['channel']} "
-                               f"{m['user'] or m['bot_id']}: {m['text']}",
+                               f"{m['from']}: {m['text']}",
                           flush=True)
                 ws.close()
             except Exception as e:  # noqa: BLE001
@@ -591,12 +597,16 @@ class Telegram:
             sender = getattr(m.sender, "username", None) \
                 or getattr(m.sender, "title", None) \
                 or getattr(m.chat, "title", None) or "?"
-            entry = {"env": self.env_name, "channel": target,
-                     "ts": str(m.id),
+            entry = {"account": self.env_name, "channel": target,
+                     "addr": f"{self.env_name}:{target}",
+                     "id": str(m.id),
                      "time": m.date.isoformat().replace("+00:00", "Z")
                      if getattr(m, "date", None) else None,
-                     "thread": None,
-                     "from": sender, "text": m.text or ""}
+                     "thread": (str(m.reply_to.reply_to_msg_id)
+                                if getattr(m, "reply_to", None) else None),
+                     "from": sender,
+                     "user": str(getattr(m, "sender_id", "") or "") or None,
+                     "text": m.text or ""}
             if self.trust:
                 entry["trust"] = self.trust
             if files and m.media and getattr(m, "file", None) \
@@ -625,7 +635,7 @@ def fmt(m, addr=None):
         (f" ({m['trust']})" if m.get("trust") else "")
     who = m["from"] + tag
     where = f"{addr} " if addr else ""
-    when = m.get("time") or m.get("ts") or ""
+    when = m.get("time") or m.get("id") or ""
     line = f"[{where}{when}] {who}: {m['text']}"
     if m.get("reactions"):
         line += "  {" + " ".join(f":{n}:x{c}"
@@ -673,8 +683,6 @@ def main():
                    help="don't download attachments")
     p.add_argument("--text", action="store_true",
                    help="human-readable output (default is JSONL)")
-    p.add_argument("--json", action="store_true",
-                   help="(default) JSONL output; accepted for compatibility")
 
     p = sub.add_parser("react", help="add/remove a reaction emoji on a Slack message")
     p.add_argument("addr")
@@ -689,8 +697,6 @@ def main():
     p.add_argument("account", nargs="?")
     p.add_argument("--text", action="store_true",
                    help="human-readable output (default is JSONL)")
-    p.add_argument("--json", action="store_true",
-                   help="(default) JSONL output; accepted for compatibility")
 
     p = sub.add_parser("login", help="one-time interactive Telegram login")
     p.add_argument("account", nargs="?")
@@ -817,7 +823,6 @@ def main():
             if any_new or not args.block:
                 for a, en, k, t, msgs, nc in results:
                     for m in msgs:
-                        m["addr"] = a
                         print(fmt(m, a if multi else None) if args.text
                               else json.dumps(m, ensure_ascii=False))
                     if not args.peek and not args.last and nc:

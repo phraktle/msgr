@@ -107,6 +107,28 @@ allow_post = true                      # whole account writable
 allow_post = ["#ops", "@alice"]        # only these addresses
 ```
 
+## Message schema
+
+`read` and `listen` emit one JSON object per message (same shape on every
+platform):
+
+| field | meaning |
+|-------|---------|
+| `id` | the message ID — pass it verbatim to `--thread` / `react` / replies |
+| `time` | ISO8601 UTC timestamp |
+| `account` | msgr account name |
+| `channel` | channel / chat / folder id within the account |
+| `addr` | canonical reply address (`account:channel`) |
+| `thread` | parent/root message id, or null |
+| `from` | sender display name |
+| `user` | sender's platform id (raw), or null |
+| `owner` | true if the sender is the configured operator (authenticated) |
+| `text` | message body |
+| `trust`, `reactions`, `files`, `files_note` | present when applicable |
+
+Reformat `time`, never `id` (the id is the platform's message key). Add
+`--text` for a human-readable rendering instead of JSON.
+
 ## Notes
 
 - **Slack**: the bot must be a member of channels it reads or posts to.
