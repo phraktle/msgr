@@ -45,6 +45,11 @@ Patterns (for agents):
     printed [attachment: /path] can be opened directly (agents: use your
     file-reading tool on it to view images). --no-files to skip. Slack needs
     the files:read scope.
+  * Reads can be scoped: `allow_read = ["#chan", "@person", ...]` restricts
+    an environment to those addresses only (absent = read anything the
+    account can see). Use it when the account has more access than the agent
+    should (e.g. a personal account where only a few channels are its
+    business).
   * Environments are QUIET BY DEFAULT: reading always works, but send/react/
     upload are refused until the config arms the environment with
     `allow_post = true` (whole environment) or `allow_post = ["#chan",
@@ -121,6 +126,20 @@ def resolve_addr(cfg, addr):
         die(f"bad address '{addr}': empty channel name")
     name, env = pick_env(cfg, env_name or None)
     return name, env, kind, target
+
+
+def scope_match(cfg, env_name, kind, target, client, allow_list):
+    """True if (kind, target) canonically matches an entry of allow_list."""
+    def canon(k, t):
+        if isinstance(client, Slack):
+            return (k, client.target_id(k, t))
+        return (k, t.lstrip("@").lower())
+    me = canon(kind, target)
+    for a in allow_list:
+        en2, _env2, k2, t2 = resolve_addr(cfg, a)
+        if en2 == env_name and canon(k2, t2) == me:
+            return True
+    return False
 
 
 def platform_client(env_name, env):
@@ -387,7 +406,7 @@ class Slack:
                  "private" if c.get("is_private") else "public")
                 for c in chans], note
 
-    def listen(self, json_out):
+    def listen(self, json_out, only=None):
         if not self.app_token:
             die(f"environment '{self.env_name}': listen needs app_token "
                 f"(Slack app-level token with connections:write)")
@@ -421,6 +440,8 @@ class Slack:
                         continue
                     ev = env.get("payload", {}).get("event", {})
                     if ev.get("type") != "message" or ev.get("subtype"):
+                        continue
+                    if only is not None and ev.get("channel") not in only:
                         continue
                     m = {"env": self.env_name, "channel": ev.get("channel"),
                          "user": ev.get("user"), "bot_id": ev.get("bot_id"),
@@ -643,27 +664,25 @@ def main():
         client = platform_client(name, env)
         if not isinstance(client, Slack):
             die("listen is Slack-only for now")
-        client.listen(args.json)
+        only = None
+        ar = env.get("allow_read")
+        if isinstance(ar, list):
+            only = set()
+            for a in ar:
+                en2, _e, k2, t2 = resolve_addr(cfg, a)
+                if en2 == name:
+                    only.add(client.target_id(k2, t2))
+        client.listen(args.json, only=only)
         return
 
     if args.cmd in ("react", "send"):
         env_name, env, kind, target = resolve_addr(cfg, args.addr)
         client = platform_client(env_name, env)
         allow = env.get("allow_post", False)
-        if isinstance(allow, list):
-            def canon(en, k, t, cl):
-                return (en, k, cl.target_id(k, t)) \
-                    if isinstance(cl, Slack) else (en, k, t.lstrip("@").lower())
-            me = canon(env_name, kind, target, client)
-            ok = False
-            for a in allow:
-                en2, env2, k2, t2 = resolve_addr(cfg, a)
-                if en2 == env_name and canon(en2, k2, t2, client) == me:
-                    ok = True
-                    break
-            if not ok:
-                die(f"'{args.addr}' is not whitelisted in environment "
-                    f"'{env_name}' allow_post (config)")
+        if isinstance(allow, list) and \
+                not scope_match(cfg, env_name, kind, target, client, allow):
+            die(f"'{args.addr}' is not whitelisted in environment "
+                f"'{env_name}' allow_post (config)")
         if args.cmd == "react":
             if not isinstance(client, Slack):
                 die("react is Slack-only")
@@ -694,6 +713,11 @@ def main():
             en, env, k, t = resolve_addr(cfg, a)
             if en not in clients:
                 clients[en] = platform_client(en, env)
+            ar = env.get("allow_read")
+            if isinstance(ar, list) and \
+                    not scope_match(cfg, en, k, t, clients[en], ar):
+                die(f"'{a}' is not whitelisted in environment '{en}' "
+                    f"allow_read (config)")
             targets.append((a, en, clients[en], k, t))
         multi = len(targets) > 1
 

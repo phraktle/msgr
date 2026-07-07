@@ -74,6 +74,17 @@ alerts = "work#C0123456789"    # private Slack channels: use the ID
 daily = "news@daily_updates"
 ```
 
+## Read scoping
+
+By default an environment reads anything its account can see. `allow_read`
+restricts it — for accounts with more access than the agent's business:
+
+```toml
+[envs.personal]
+platform = "telegram"
+allow_read = ["@exchange_news", "@status_updates"]   # nothing else readable
+```
+
 ## Posting is opt-in
 
 Environments are **quiet by default**: `read`/`listen` always work, but
@@ -117,8 +128,10 @@ allow_post = ["#ops", "@alice"]        # only these addresses
 - **Cursors** live in `~/.local/state/msgr/cursors/`, one per
   `(consumer, environment, channel)`. First read of a channel returns only
   the last 20 messages rather than all history.
-- Not yet: Telegram in `listen`/`channels`, threads beyond Slack `--thread`
-  replies, media attachments.
+- Not yet: Telegram in `listen`/`channels`; email as a platform (the model
+  maps cleanly: env = mailbox account, `#folder` channels with IMAP UID
+  cursors, `@address` sends via SMTP, MIME attachments to the spool,
+  `allow_read` scoping to folders).
 
 ## Install
 
