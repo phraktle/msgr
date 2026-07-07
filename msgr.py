@@ -8,6 +8,9 @@ takes args or stdin, output is plain chronological text (or --json).
 Addresses:
     env#channel      channel in a named environment (Slack channel, Telegram chat)
     env@person       direct message with a person in that environment
+    foo@bar.com      a bare email-like address = that person in the default
+                     environment (email once supported; on Slack, resolves
+                     the member with that email)
     @                the operator's DM (config owner; Telegram: Saved Messages)
     #channel  @person   the default environment ($MSGR_ENV, or config
                         default_env, or the only one configured)
@@ -118,10 +121,17 @@ def resolve_addr(cfg, addr):
         seen.add(addr)
         addr = aliases[addr]
     m = ADDR_RE.match(addr)
-    if not m:
-        die(f"bad address '{addr}' — expected [env]#channel or [env]@person, "
-            f"or an alias from the config")
-    env_name, kind, target = m.groups()
+    envs = cfg.get("envs", {})
+    if m and (not m.group(1) or m.group(1) in envs):
+        env_name, kind, target = m.groups()
+    elif "@" in addr or "#" in addr:
+        # not env-prefixed (e.g. a bare email address): whole string is the
+        # target in the default environment
+        kind = "#" if addr.startswith("#") else "@"
+        env_name, target = "", addr.lstrip("#@") if addr[0] in "#@" else addr
+    else:
+        die(f"bad address '{addr}' — expected [env]#channel, [env]@person, "
+            f"an email-like recipient, or an alias from the config")
     if kind == "#" and not target:
         die(f"bad address '{addr}': empty channel name")
     name, env = pick_env(cfg, env_name or None)
@@ -212,6 +222,9 @@ class Slack:
 
     def _find_user(self, name):
         name = name.lstrip("@").lower()
+        if "@" in name and "." in name.rsplit("@", 1)[-1]:
+            u = self.api("users.lookupByEmail", email=name)
+            return u["user"]["id"]
         cursor = ""
         while True:
             resp = self.api("users.list", limit=500, cursor=cursor)
