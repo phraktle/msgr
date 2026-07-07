@@ -88,6 +88,11 @@ STATE_DIR = pathlib.Path(
 ) / "msgr"
 
 FILE_CAP = 20 * 1024 * 1024  # skip attachment downloads larger than this
+FILES_ROOT = None  # set from config `files_dir` in main(); default under STATE_DIR
+
+
+def files_root():
+    return pathlib.Path(FILES_ROOT) if FILES_ROOT else STATE_DIR / "files"
 
 
 def die(msg, code=1):
@@ -331,7 +336,7 @@ class Slack:
     def _fetch_file(self, f):
         fid = f.get("id", "f")
         name = re.sub(r"[^A-Za-z0-9._-]", "_", f.get("name") or "file")
-        dest = STATE_DIR / "files" / self.env_name / f"{fid}-{name}"
+        dest = files_root() / self.env_name / f"{fid}-{name}"
         if dest.exists():
             return str(dest)
         url = f.get("url_private_download") or f.get("url_private")
@@ -350,6 +355,8 @@ class Slack:
                 or data[:6].lower() == b"<html>":
             return None
         dest.write_bytes(data)
+        os.chmod(dest, 0o644)
+        os.chmod(dest.parent, 0o755)
         return str(dest)
 
     def send_file(self, kind, target, path, text=None, thread=None):
@@ -577,11 +584,13 @@ class Telegram:
                     and (m.file.size or 0) <= FILE_CAP:
                 name = re.sub(r"[^A-Za-z0-9._-]", "_",
                               m.file.name or f"{m.id}{m.file.ext or '.bin'}")
-                dest = STATE_DIR / "files" / self.env_name / f"{m.id}-{name}"
+                dest = files_root() / self.env_name / f"{m.id}-{name}"
                 if not dest.exists():
                     dest.parent.mkdir(parents=True, exist_ok=True)
+                    os.chmod(dest.parent, 0o755)
                     try:
                         c.download_media(m, file=str(dest))
+                        os.chmod(dest, 0o644)
                     except Exception:  # noqa: BLE001
                         dest = None
                 if dest:
@@ -664,6 +673,8 @@ def main():
     if getattr(args, "consumer", "x") is None:
         args.consumer = os.environ.get("MSGR_AS") or "default"
     cfg = load_config()
+    global FILES_ROOT
+    FILES_ROOT = cfg.get("files_dir")
 
     if args.cmd == "login":
         name, env = pick_account(cfg, args.account)
