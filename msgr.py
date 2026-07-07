@@ -1,26 +1,31 @@
 #!/usr/bin/env python3
-"""msgr — minimal multi-environment channel mailbox CLI (Slack, Telegram).
+"""msgr — minimal multi-account channel mailbox CLI (Slack, Telegram).
 
 Built for LLM agents and shell scripts: `read` is a mailbox (returns only new
 messages since that consumer's last read, then advances a cursor), `send`
 takes args or stdin, output is plain chronological text (or --json).
 
-Addresses:
-    env#channel      channel in a named environment (Slack channel, Telegram chat)
-    env@person       direct message with a person in that environment
-    foo@bar.com      a bare email-like address = that person in the default
-                     environment (email once supported; on Slack, resolves
-                     the member with that email)
-    @                the operator's DM (config owner; Telegram: Saved Messages)
-    #channel  @person   the default environment ($MSGR_ENV, or config
-                        default_env, or the only one configured)
-    ops              any alias defined in the config
+Addresses (URI-like — the account is the scheme, the target is written in
+the platform's own syntax):
+
+    dl:#ops              a Slack channel in account "dl"
+    dl:@alice            DM with a person
+    dl:@                 the operator's own DM (config owner)
+    tg:@some_channel     a Telegram channel/handle
+    tg:-100123456        a Telegram chat by numeric ID
+    robot:foo@bar.com    an email recipient (email accounts, when supported)
+    robot:INBOX          a mail folder
+    #ops  @alice  @      no account prefix = the default account
+    standup              any alias from the config
+
+The default account is $MSGR_ACCOUNT, else `default_account` in the config,
+else the only account configured.
 
 Examples:
     msgr send "#ops" "deploy finished"
     echo "long report..." | msgr send standup
-    msgr read "news@weather_updates" --as morning-loop
-    msgr read "#alerts" "#ops" "news@daily" --as watcher --block --timeout 3600
+    msgr read "tg:@some_channel" --as morning-loop
+    msgr read "#alerts" "#ops" "tg:@news" --as watcher --block --timeout 3600
     msgr read "#alerts" --last 50
     msgr read "@" "#alerts" --as my-agent --block   # poll own DMs + a channel
 
@@ -82,7 +87,6 @@ STATE_DIR = pathlib.Path(
     os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
 ) / "msgr"
 
-ADDR_RE = re.compile(r"^([A-Za-z0-9_-]*)([#@])(.*)$")
 FILE_CAP = 20 * 1024 * 1024  # skip attachment downloads larger than this
 
 
@@ -101,41 +105,51 @@ def load_config():
     return {}
 
 
-def pick_env(cfg, name=None):
-    envs = cfg.get("envs", {})
+def pick_account(cfg, name=None):
+    envs = cfg.get("accounts", {})
     if not envs:
-        die("no environments configured (add [envs.<name>] to the config)")
-    name = (name or os.environ.get("MSGR_ENV") or cfg.get("default_env")
+        die("no accounts configured (add [accounts.<name>] to the config)")
+    name = (name or os.environ.get("MSGR_ACCOUNT") or cfg.get("default_account")
             or (next(iter(envs)) if len(envs) == 1 else None))
     if not name:
-        die("multiple environments configured — set default_env or $MSGR_ENV")
+        die("multiple accounts configured — set default_account or $MSGR_ACCOUNT")
     if name not in envs:
-        die(f"unknown environment '{name}'")
+        die(f"unknown account '{name}'")
     return name, envs[name]
 
 
 def resolve_addr(cfg, addr):
-    """Return (env_name, env_cfg, kind, target); kind is '#' or '@'."""
+    """Return (account_name, account_cfg, kind, target).
+
+    URI-like grammar: account:target — the account is the scheme, the target
+    is platform-native (#chan, @person, foo@bar.com, C0…, -100123, INBOX).
+    No colon = target in the default account. Aliases expand first.
+    """
     aliases, seen = cfg.get("aliases", {}), set()
     while addr in aliases and addr not in seen:
         seen.add(addr)
         addr = aliases[addr]
-    m = ADDR_RE.match(addr)
-    envs = cfg.get("envs", {})
-    if m and (not m.group(1) or m.group(1) in envs):
-        env_name, kind, target = m.groups()
-    elif "@" in addr or "#" in addr:
-        # not env-prefixed (e.g. a bare email address): whole string is the
-        # target in the default environment
-        kind = "#" if addr.startswith("#") else "@"
-        env_name, target = "", addr.lstrip("#@") if addr[0] in "#@" else addr
+    accounts = cfg.get("accounts", {})
+    if ":" in addr:
+        acct, _, target = addr.partition(":")
+        if acct not in accounts:
+            die(f"unknown account '{acct}' in '{addr}'")
     else:
-        die(f"bad address '{addr}' — expected [env]#channel, [env]@person, "
-            f"an email-like recipient, or an alias from the config")
-    if kind == "#" and not target:
+        acct, target = "", addr
+    if not target:
+        die(f"bad address '{addr}': empty target")
+    name, account = pick_account(cfg, acct or None)
+    if target.startswith("#"):
+        kind, t = "#", target[1:]
+    elif target.startswith("@"):
+        kind, t = "@", target[1:]
+    elif "@" in target:
+        kind, t = "@", target        # email-like recipient
+    else:
+        kind, t = "#", target        # channel id / numeric id / folder
+    if kind == "#" and not t:
         die(f"bad address '{addr}': empty channel name")
-    name, env = pick_env(cfg, env_name or None)
-    return name, env, kind, target
+    return name, account, kind, t
 
 
 def scope_match(cfg, env_name, kind, target, client, allow_list):
@@ -158,7 +172,7 @@ def platform_client(env_name, env):
         return Slack(env_name, env)
     if plat == "telegram":
         return Telegram(env_name, env)
-    die(f"environment '{env_name}': unknown platform '{plat}'")
+    die(f"account '{env_name}': unknown platform '{plat}'")
 
 
 def cursor_path(consumer, env_name, kind, target):
@@ -204,7 +218,7 @@ class Slack:
         self.armed = env.get("allow_post", False)
         self.trust = env.get("trust")
         if not self.token:
-            die(f"environment '{env_name}': no bot_token")
+            die(f"account '{env_name}': no bot_token")
         self._users = {}
 
     def api(self, method, _quiet=False, **params):
@@ -296,7 +310,7 @@ class Slack:
 
     def _check_writable(self):
         if not self.armed:
-            die(f"environment '{self.env_name}' is not armed for posting "
+            die(f"account '{self.env_name}' is not armed for posting "
                 f"(set allow_post in the config)")
 
     def send(self, kind, target, text, thread=None):
@@ -421,7 +435,7 @@ class Slack:
 
     def listen(self, json_out, only=None):
         if not self.app_token:
-            die(f"environment '{self.env_name}': listen needs app_token "
+            die(f"account '{self.env_name}': listen needs app_token "
                 f"(Slack app-level token with connections:write)")
         try:
             import websocket
@@ -486,7 +500,7 @@ class Telegram:
         self.session = os.path.expanduser(
             env.get("session", f"~/.local/state/msgr/{env_name}.session"))
         if not self.api_id or not self.api_hash:
-            die(f"environment '{env_name}': telegram api_id/api_hash not set")
+            die(f"account '{env_name}': telegram api_id/api_hash not set")
 
     @staticmethod
     def _entity(kind, target):
@@ -509,7 +523,7 @@ class Telegram:
         c.connect()
         if not c.is_user_authorized():
             die(f"telegram session not authorized — run: "
-                f"msgr tg-login {self.env_name}")
+                f"msgr login {self.env_name}")
         return c
 
     def login(self):
@@ -532,7 +546,7 @@ class Telegram:
 
     def _check_writable(self):
         if not self.armed:
-            die(f"environment '{self.env_name}' is not armed for posting "
+            die(f"account '{self.env_name}' is not armed for posting "
                 f"(set allow_post in the config)")
 
     def send_file(self, kind, target, path, text=None, thread=None):
@@ -636,30 +650,31 @@ def main():
     p.add_argument("emoji")
     p.add_argument("--remove", action="store_true")
 
-    p = sub.add_parser("channels", help="list channels the bot can see")
-    p.add_argument("env", nargs="?")
+    p = sub.add_parser("list", help="list channels the bot can see")
+    p.add_argument("account", nargs="?")
 
     p = sub.add_parser("listen", help="stream messages as they arrive (Slack)")
-    p.add_argument("env", nargs="?")
+    p.add_argument("account", nargs="?")
     p.add_argument("--json", action="store_true", help="JSONL output")
 
-    p = sub.add_parser("tg-login", help="one-time interactive Telegram login")
-    p.add_argument("env", nargs="?")
+    p = sub.add_parser("login", help="one-time interactive Telegram login")
+    p.add_argument("account", nargs="?")
 
     args = ap.parse_args()
     if getattr(args, "consumer", "x") is None:
         args.consumer = os.environ.get("MSGR_AS") or "default"
     cfg = load_config()
 
-    if args.cmd == "tg-login":
-        name, env = pick_env(cfg, args.env)
+    if args.cmd == "login":
+        name, env = pick_account(cfg, args.account)
         if env.get("platform") != "telegram":
-            die(f"environment '{name}' is not telegram")
+            die(f"account '{name}' does not use interactive login "
+                f"(only telegram does)")
         Telegram(name, env).login()
         return
 
-    if args.cmd == "channels":
-        name, env = pick_env(cfg, args.env)
+    if args.cmd == "list":
+        name, env = pick_account(cfg, args.account)
         client = platform_client(name, env)
         if not isinstance(client, Slack):
             die("channels is Slack-only for now")
@@ -673,7 +688,7 @@ def main():
         return
 
     if args.cmd == "listen":
-        name, env = pick_env(cfg, args.env)
+        name, env = pick_account(cfg, args.account)
         client = platform_client(name, env)
         if not isinstance(client, Slack):
             die("listen is Slack-only for now")
@@ -729,7 +744,7 @@ def main():
             ar = env.get("allow_read")
             if isinstance(ar, list) and \
                     not scope_match(cfg, en, k, t, clients[en], ar):
-                die(f"'{a}' is not whitelisted in environment '{en}' "
+                die(f"'{a}' is not whitelisted in account '{en}' "
                     f"allow_read (config)")
             targets.append((a, en, clients[en], k, t))
         multi = len(targets) > 1

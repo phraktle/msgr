@@ -1,6 +1,6 @@
 # msgr
 
-Minimal multi-environment channel **mailbox** CLI — Slack and Telegram —
+Minimal multi-account channel **mailbox** CLI — Slack and Telegram —
 built for LLM agents and shell scripts.
 
 The core idea: an agent shouldn't manage timestamps or connections. `read` is
@@ -11,34 +11,41 @@ required.
 ```bash
 msgr send "#ops" "deploy finished"
 echo "long report..." | msgr send standup       # alias from config
-msgr read "news@daily_updates"                  # only new posts since last read
+msgr read "news:@daily_updates"                  # only new posts since last read
 msgr read "#alerts" --as pnl-loop               # independent cursor per agent
 msgr read "#alerts" --last 50                   # plain history, no cursor
 msgr read "#alerts" --peek                      # look without consuming
 msgr read "#alerts" --json                      # JSONL for scripts
-msgr send "work@alice" "lunch?"                 # direct message
+msgr send "work:@alice" "lunch?"                 # direct message
 msgr read "#alerts" "#ops" --as watcher --block --timeout 3600
                                                 # long-poll: block until any
                                                 # address has new messages,
                                                 # print them (exit 3: timeout)
-msgr channels                                   # what the bot can see
+msgr list                                   # what the bot can see
 msgr listen --json                              # stream messages (Socket Mode)
 msgr react "#ops" 1712345678.123 white_check_mark
-msgr tg-login news                              # one-time Telegram session setup
+msgr login news                              # one-time Telegram session setup
 ```
 
 ## Addresses
 
+URI-like: the **account is the scheme**, the target is written in the
+platform's own syntax (like `mailto:foo@bar.com`).
+
 ```
-env#channel     channel in a named environment
-env@person      direct message in that environment
-#channel        default environment
-@person         default environment
-standup         any alias from the config
+dl:#ops              Slack channel in account "dl"
+dl:@alice            DM with a person
+dl:@                 the operator's own DM
+tg:@some_channel     Telegram channel/handle
+tg:-100123456        Telegram chat by numeric ID
+robot:foo@bar.com    email recipient (email accounts, when supported)
+robot:INBOX          mail folder
+#ops  @alice  @      no prefix = the default account
+standup              any alias from the config
 ```
 
-The default environment is `$MSGR_ENV`, else `default_env` from the config,
-else the only environment configured.
+The default account is `$MSGR_ACCOUNT`, else `default_account` in the
+config, else the only account configured.
 
 ## Config
 
@@ -46,9 +53,9 @@ First found of: `$MSGR_CONFIG`, `~/.config/msgr/config.toml`,
 `/etc/msgr/config.toml`.
 
 ```toml
-default_env = "work"
+default_account = "work"
 
-[envs.work]
+[accounts.work]
 platform = "slack"
 bot_token = "xoxb-..."
 app_token = "xapp-..."      # only needed for `listen` (Socket Mode)
@@ -57,11 +64,11 @@ owner = "U0123456789"       # optional: the operator's user ID — their
                             # in read/listen output, so agents can tell the
                             # operator apart from anyone merely claiming to be
 
-[envs.family]
+[accounts.family]
 platform = "slack"
 bot_token = "xoxb-..."
 
-[envs.news]
+[accounts.news]
 platform = "telegram"
 api_id = 12345
 api_hash = "0123456789abcdef"
@@ -69,33 +76,33 @@ phone = "+15551234567"
 session = "~/.local/state/msgr/news.session"   # default: <env>.session
 
 [aliases]
-standup = "work#standup"
-alerts = "work#C0123456789"    # private Slack channels: use the ID
-daily = "news@daily_updates"
+standup = "work:#standup"
+alerts = "work:C0123456789"    # private Slack channels: use the ID
+daily = "news:@daily_updates"
 ```
 
 ## Read scoping
 
-By default an environment reads anything its account can see. `allow_read`
+By default an account reads anything its account can see. `allow_read`
 restricts it — for accounts with more access than the agent's business:
 
 ```toml
-[envs.personal]
+[accounts.personal]
 platform = "telegram"
 allow_read = ["@exchange_news", "@status_updates"]   # nothing else readable
 ```
 
 ## Posting is opt-in
 
-Environments are **quiet by default**: `read`/`listen` always work, but
-`send`, `react`, and uploads are refused until the environment is armed:
+Accounts are **quiet by default**: `read`/`listen` always work, but
+`send`, `react`, and uploads are refused until the account is armed:
 
 ```toml
-[envs.work]
-allow_post = true                      # whole environment writable
-[envs.news]
+[accounts.work]
+allow_post = true                      # whole account writable
+[accounts.news]
 # no allow_post -> pure notetaker: can read, can never post
-[envs.other]
+[accounts.other]
 allow_post = ["#ops", "@alice"]        # only these addresses
 ```
 
@@ -110,7 +117,7 @@ allow_post = ["#ops", "@alice"]        # only these addresses
   (+ `groups:history` for private channels, `im:write` for DMs,
   `reactions:write` for react).
 - **Telegram**: uses a user-account MTProto session (Telethon). Run
-  `msgr tg-login <env>` once interactively; after that reads/sends are
+  `msgr login <account>` once interactively; after that reads/sends are
   one-shot. The session file is as sensitive as being logged in — guard it.
 - **`read --block`** is the long-poll gate for agent loops: if nothing is
   new it blocks (cheap API polling, no LLM anywhere) until one of the
@@ -126,7 +133,7 @@ allow_post = ["#ops", "@alice"]        # only these addresses
   `--no-files` skips downloads. Slack needs the `files:read` scope; without
   it you get a `files_note` naming the undownloadable attachments.
 - **Cursors** live in `~/.local/state/msgr/cursors/`, one per
-  `(consumer, environment, channel)`. First read of a channel returns only
+  `(consumer, account, channel)`. First read of a channel returns only
   the last 20 messages rather than all history.
 - Not yet: Telegram in `listen`/`channels`; email as a platform (the model
   maps cleanly: env = mailbox account, `#folder` channels with IMAP UID
