@@ -772,7 +772,7 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser("send", help="send a message (text args or stdin)")
+    p = sub.add_parser("send", help="send a message (text args, or '-'/no-arg for stdin)")
     p.add_argument("addr")
     p.add_argument("text", nargs="*")
     p.add_argument("--thread", help="Slack thread ts to reply in")
@@ -879,8 +879,15 @@ def main():
             client.react(kind, target, args.ts, args.emoji,
                          remove=args.remove)
             return
-        text = " ".join(args.text) if args.text \
-            else ("" if getattr(args, "files", None) else sys.stdin.read().strip())
+        # a lone "-" (or no text arg) means read stdin — the unix idiom, so
+        # `msgr send addr - <<'EOF'` pipes a multi-line body instead of
+        # posting a literal dash.
+        if args.text and args.text != ["-"]:
+            text = " ".join(args.text)
+        elif getattr(args, "files", None):
+            text = ""
+        else:
+            text = sys.stdin.read().strip()
         if getattr(args, "files", None):
             for i, path in enumerate(args.files):
                 if not os.path.isfile(path):
