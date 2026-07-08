@@ -646,6 +646,11 @@ class ClaudeCode:
     Reverse-engineered from Claude Code's private daemon IPC; may change
     across Claude Code releases. Runs as the user that owns the daemon (the
     control key is that user's, and no external secret is involved).
+
+    Exit codes on `send`: 0 delivered, 2 no such live agent, 3 transport
+    error, 4 agent not accepting input (e.g. blocked at a prompt) — so a
+    caller can distinguish "dead" (retry elsewhere) from "busy at a dialog"
+    (don't disturb).
     """
 
     def __init__(self, env_name, env):
@@ -713,14 +718,17 @@ class ClaudeCode:
             if resp.get("code") == "ENOJOB":
                 continue          # not this daemon's agent — try the next
             break                 # owning daemon answered: definitive
+        # distinct exit codes so scripts can branch on the failure class
+        # (2 recipient-not-found, 3 transport error, 4 recipient-not-accepting)
         code = (last or {}).get("code")
         if code == "ENOREPLY":
             die(f"claude-code: agent {target} isn't accepting input right "
-                f"now (busy at a prompt?) — try again shortly")
+                f"now (busy at a prompt?) — try again shortly", code=4)
         if last is None or code == "ENOJOB":
-            die(f"claude-code: no running agent with session id {target}")
+            die(f"claude-code: no running agent with session id {target}",
+                code=2)
         die(f"claude-code: delivery failed ({code}): "
-            f"{(last or {}).get('error', 'unknown')}")
+            f"{(last or {}).get('error', 'unknown')}", code=3)
 
     def _unsupported(self, op):
         die(f"'{op}' is not supported for the claude-code transport "
