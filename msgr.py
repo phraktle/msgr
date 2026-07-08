@@ -73,10 +73,12 @@ Patterns (for agents):
 """
 
 import argparse
+import glob
 import json
 import os
 import pathlib
 import re
+import socket
 import sys
 import urllib.parse
 import urllib.request
@@ -192,6 +194,8 @@ def platform_client(env_name, env):
         return Slack(env_name, env)
     if plat == "telegram":
         return Telegram(env_name, env)
+    if plat == "claude-code":
+        return ClaudeCode(env_name, env)
     die(f"account '{env_name}': unknown platform '{plat}'")
 
 
@@ -626,6 +630,113 @@ class Telegram:
                     entry["files"] = [str(dest)]
             out.append(entry)
         return out, (str(msgs[-1].id) if msgs else cursor)
+
+
+# ---------------------------------------------------------- Claude Code
+class ClaudeCode:
+    """Send-only transport to running Claude Code background agents.
+
+    The target is an agent's session id (`claude agents`). Delivery goes over
+    the local cc-daemon control socket (`op:"reply"`, newline-delimited JSON,
+    authed by ~/.claude/daemon/control.key): the daemon enqueues the text as
+    the agent's next human user message and acks. Idle agents start a turn;
+    busy agents queue it. There is no read side — inspect an agent with
+    `claude logs` / `claude attach`.
+
+    Reverse-engineered from Claude Code's private daemon IPC; may change
+    across Claude Code releases. Runs as the user that owns the daemon (the
+    control key is that user's, and no external secret is involved).
+    """
+
+    def __init__(self, env_name, env):
+        self.env_name = env_name
+        self.armed = env.get("allow_post", False)
+        self.trust = env.get("trust")
+        self.owner = None
+        self.keyfile = os.path.expanduser(
+            env.get("control_key", "~/.claude/daemon/control.key"))
+        self.sock_glob = env.get(
+            "control_sock", f"/tmp/cc-daemon-{os.getuid()}/*/control.sock")
+
+    def _check_writable(self):
+        if not self.armed:
+            die(f"account '{self.env_name}' is not armed for posting "
+                f"(set allow_post in the config)")
+
+    def _key(self):
+        try:
+            return open(self.keyfile).read().strip()
+        except OSError:
+            die(f"claude-code: can't read daemon control key "
+                f"{self.keyfile} (is Claude Code running as this user?)")
+
+    @staticmethod
+    def _rpc(sock_path, req, timeout=15):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        try:
+            s.connect(sock_path)
+            s.sendall((json.dumps(req) + "\n").encode())
+            buf = b""
+            while b"\n" not in buf:
+                chunk = s.recv(65536)
+                if not chunk:
+                    break
+                buf += chunk
+            line = buf.split(b"\n", 1)[0]
+            return json.loads(line) if line else None
+        finally:
+            s.close()
+
+    def send(self, kind, target, text, thread=None):
+        self._check_writable()
+        if not re.fullmatch(r"[a-f0-9]{8}", target):
+            die(f"claude-code: '{target}' is not a session id "
+                f"(8 hex chars — see `claude agents`)")
+        socks = sorted(glob.glob(self.sock_glob))
+        if not socks:
+            die("claude-code: no daemon control socket found "
+                "(no background agents running?)")
+        req = {"proto": 1, "op": "reply", "short": target,
+               "text": text, "auth": self._key()}
+        last = None
+        for sp in socks:
+            try:
+                resp = self._rpc(sp, req)
+            except OSError:
+                continue
+            if not resp:
+                continue
+            last = resp
+            if resp.get("ok"):
+                return {"channel": target, "ts": "delivered"}
+            if resp.get("code") == "ENOJOB":
+                continue          # not this daemon's agent — try the next
+            break                 # owning daemon answered: definitive
+        code = (last or {}).get("code")
+        if code == "ENOREPLY":
+            die(f"claude-code: agent {target} isn't accepting input right "
+                f"now (busy at a prompt?) — try again shortly")
+        if last is None or code == "ENOJOB":
+            die(f"claude-code: no running agent with session id {target}")
+        die(f"claude-code: delivery failed ({code}): "
+            f"{(last or {}).get('error', 'unknown')}")
+
+    def _unsupported(self, op):
+        die(f"'{op}' is not supported for the claude-code transport "
+            f"(send-only; use `claude logs` / `claude attach` to read)")
+
+    def send_file(self, *a, **k):
+        self._unsupported("send-file")
+
+    def read(self, *a, **k):
+        self._unsupported("read")
+
+    def react(self, *a, **k):
+        self._unsupported("react")
+
+    def listen(self, *a, **k):
+        self._unsupported("listen")
 
 
 # ------------------------------------------------------------------ CLI
