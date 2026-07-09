@@ -15,6 +15,7 @@ echo "long report..." | msgr send standup       # alias from config
 msgr read "news:@daily_updates"                  # only new posts since last read
 msgr read "#alerts" --as pnl-loop               # independent cursor per agent
 msgr read "#alerts" --last 50 --text            # human-readable (ISO time)
+msgr read "#alerts" --thread 1712345678.123     # one whole thread (root + replies)
 msgr read "#alerts" --peek                      # look without consuming
 msgr read "#alerts" --json                      # JSONL for scripts
 msgr send "work:@alice" "lunch?"                 # direct message
@@ -150,6 +151,12 @@ Reformat `time`, never `id` (the id is the platform's message key). Add
   block without consuming (shell-gate pattern: a supervisor blocks, then
   spawns an agent that reads for itself). Slack thread replies are included
   by default; `--no-threads` to exclude.
+- **`read --thread <id>`** returns one whole thread — the root message plus
+  every reply, reactions included — in the same JSON schema as a timeline
+  read. It's a one-shot read (no cursor, no blocking): `conversations.history`
+  returns only top-level timeline messages, so historical in-thread replies
+  are invisible to a plain `read`; pass the id of the root (or any message in
+  the thread) to pull the full exchange. Slack-only for now.
 - **Attachments**: `read` downloads files (≤20 MB) to
   `~/.local/state/msgr/files/` and appends `[attachment: /path]` to the
   message — point your agent's file-reading tool at the path to view images.

@@ -45,6 +45,10 @@ Patterns (for agents):
     will read for itself): add --peek to the blocking read.
   * Slack thread replies are included by default (new replies are caught
     even under old thread parents); --no-threads for feed-style channels.
+  * To read a whole thread on demand — root + every historical reply, with
+    reactions — pass its id: `read ADDR --thread <id>`. One-shot (no cursor):
+    conversations.history only returns top-level timeline messages, so old
+    in-thread replies are otherwise invisible.
   * First read of a channel returns only the last 20 messages; a blocking
     read with a fresh cursor starts "from now" and never fires on history.
   * read/listen mark the configured operator's messages with "(owner)" /
@@ -397,6 +401,36 @@ class Slack:
         self.api("files.completeUploadExternal", **params)
         return {"channel": cid, "ts": "(file)"}
 
+    def _entry(self, m, cid, files=True):
+        """Normalize one Slack message dict into msgr's JSON schema. Shared by
+        every read path (timeline history, thread replies) so a thread message
+        and a timeline message come out shaped identically."""
+        entry = {
+            "account": self.env_name, "channel": cid,
+            "addr": f"{self.env_name}:{cid}",
+            "id": m["ts"], "time": iso(m["ts"]),
+            "thread": m.get("thread_ts"),
+            "from": self.username(m.get("user") or m.get("bot_id")),
+            "user": m.get("user") or m.get("bot_id"),
+            "owner": bool(self.owner) and m.get("user") == self.owner,
+            "text": m.get("text", ""),
+        }
+        if self.trust:
+            entry["trust"] = self.trust
+        if m.get("reactions"):
+            entry["reactions"] = {r["name"]: r.get("count", 1)
+                                  for r in m["reactions"]}
+        if files and m.get("files"):
+            paths = [p for f in m["files"]
+                     if (p := self._fetch_file(f))]
+            names = [f.get("name") or "file" for f in m["files"]]
+            entry["files"] = paths or None
+            if not paths:
+                entry["files_note"] = ("attachments not downloadable: " +
+                                       ", ".join(names) +
+                                       " (files:read scope? size cap?)")
+        return entry
+
     def read(self, kind, target, cursor=None, limit=100, threads=True,
              files=True):
         """New messages after cursor, oldest first — including new thread
@@ -418,34 +452,24 @@ class Slack:
                                 if float(x["ts"]) > float(cursor)
                                 and x["ts"] != m["ts"]]
                 new.sort(key=lambda x: float(x["ts"]))
-        out = []
-        for m in new:
-            entry = {
-                "account": self.env_name, "channel": cid,
-                "addr": f"{self.env_name}:{cid}",
-                "id": m["ts"], "time": iso(m["ts"]),
-                "thread": m.get("thread_ts"),
-                "from": self.username(m.get("user") or m.get("bot_id")),
-                "user": m.get("user") or m.get("bot_id"),
-                "owner": bool(self.owner) and m.get("user") == self.owner,
-                "text": m.get("text", ""),
-            }
-            if self.trust:
-                entry["trust"] = self.trust
-            if m.get("reactions"):
-                entry["reactions"] = {r["name"]: r.get("count", 1)
-                                      for r in m["reactions"]}
-            if files and m.get("files"):
-                paths = [p for f in m["files"]
-                         if (p := self._fetch_file(f))]
-                names = [f.get("name") or "file" for f in m["files"]]
-                entry["files"] = paths or None
-                if not paths:
-                    entry["files_note"] = ("attachments not downloadable: " +
-                                           ", ".join(names) +
-                                           " (files:read scope? size cap?)")
-            out.append(entry)
+        out = [self._entry(m, cid, files=files) for m in new]
         return out, (new[-1]["ts"] if new else cursor)
+
+    def thread(self, kind, target, ts, files=True):
+        """A whole thread (root message + all replies), oldest first — a
+        one-shot read, not cursor-based. Unlike conversations.history (which
+        only returns top-level timeline messages), conversations.replies
+        returns the full in-thread exchange, reactions and all."""
+        cid = self.target_id(kind, target)
+        msgs, cursor = [], ""
+        while True:
+            r = self.api("conversations.replies", channel=cid, ts=ts,
+                         limit=200, cursor=cursor)
+            msgs += r["messages"]
+            cursor = r.get("response_metadata", {}).get("next_cursor", "")
+            if not r.get("has_more") or not cursor:
+                break
+        return [self._entry(m, cid, files=files) for m in msgs]
 
     def channels(self):
         try:
@@ -796,6 +820,9 @@ def main():
     p.add_argument("--last", type=int, metavar="N",
                    help="ignore cursors, show last N messages")
     p.add_argument("--limit", type=int, default=100)
+    p.add_argument("--thread", metavar="TS",
+                   help="Slack: read one whole thread (root + all replies) "
+                        "by its id, one-shot; ignores cursors")
     p.add_argument("--no-threads", action="store_true",
                    help="Slack: exclude thread replies")
     p.add_argument("--no-files", action="store_true",
@@ -905,6 +932,24 @@ def main():
 
     if args.cmd == "read":
         import time
+        if args.thread:
+            # one-shot: the whole thread now, no cursor, no blocking
+            if len(args.addrs) != 1:
+                die("--thread reads a single thread; give one address")
+            en, env, k, t = resolve_addr(cfg, args.addrs[0])
+            client = platform_client(en, env)
+            ar = env.get("allow_read")
+            if isinstance(ar, list) and \
+                    not scope_match(cfg, en, k, t, client, ar):
+                die(f"'{args.addrs[0]}' is not whitelisted in account "
+                    f"'{en}' allow_read (config)")
+            if not isinstance(client, Slack):
+                die("--thread is Slack-only for now")
+            for m in client.thread(k, t, args.thread,
+                                    files=not args.no_files):
+                print(fmt(m) if args.text
+                      else json.dumps(m, ensure_ascii=False))
+            return
         clients, targets = {}, []
         for a in args.addrs:
             en, env, k, t = resolve_addr(cfg, a)
