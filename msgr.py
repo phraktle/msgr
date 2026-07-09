@@ -504,8 +504,17 @@ class Slack:
                 resp = json.load(urllib.request.urlopen(req, timeout=30))
                 if not resp.get("ok"):
                     die(f"apps.connections.open: {resp.get('error')}")
-                ws = websocket.create_connection(resp["url"], timeout=120)
+                ws = websocket.create_connection(resp["url"], timeout=45)
+                # Cap the connection's life. A socket-mode connection can go
+                # half-open — the TCP peer is gone but recv() just keeps timing
+                # out and ws.ping() "succeeds" writing into the void — and then
+                # it silently delivers nothing forever. Recycling on a deadline
+                # guarantees a stale socket is replaced (worst case ~15 min)
+                # instead of leaving the listener permanently deaf.
+                deadline = time.time() + 900
                 while True:
+                    if time.time() > deadline:
+                        break  # proactively recycle a possibly-stale socket
                     try:
                         raw = ws.recv()
                     except websocket.WebSocketTimeoutException:
