@@ -494,33 +494,60 @@ class Slack:
             import websocket
         except ImportError:
             die("websocket-client not installed (pip install 'msgr[listen]')")
+        import fcntl
         import os
         import signal
         import time
 
-        # Sole-listener guard. Socket mode delivers each event to exactly ONE
-        # open connection, so a second `listen` on the same account silently
-        # STEALS a share of events from the first (and a consumer blocked on
-        # its output goes intermittently deaf). Evict any prior listener for
-        # this account and claim ownership via a pidfile, so a restart or a
-        # stray listener can't accumulate into event-splitting.
-        lockfile = f"/tmp/.msgr-listen-{self.env_name}.pid"
-        try:
-            if os.path.exists(lockfile):
-                old = int((open(lockfile).read().strip() or "0"))
-                if old and old != os.getpid():
+        # Sole-listener GUARANTEE. Socket mode delivers each event to exactly
+        # ONE of an app's open connections (Slack distributes, never
+        # broadcasts), so a second `listen` on the same account silently steals
+        # a share of events — any consumer blocked on its output goes
+        # intermittently deaf. Enforce at-most-one listener per account with a
+        # kernel exclusive lock (held for our lifetime, auto-released if we
+        # crash — no stale locks), and TAKE OVER an orphaned/older holder so a
+        # restart always wins and a leak can't accumulate into event-splitting.
+        # (A pidfile alone can't: two racing starts both read it empty.)
+        self._listen_lock = open(f"/tmp/.msgr-listen-{self.env_name}.lock", "a+")
+        lf = self._listen_lock
+
+        def _try_lock():
+            try:
+                fcntl.flock(lf, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return True
+            except OSError:
+                return False
+
+        if not _try_lock():
+            try:
+                lf.seek(0)
+                holder = int((lf.read().strip() or "0"))
+            except ValueError:
+                holder = 0
+
+            def _signal(sig):
+                if holder and holder != os.getpid():
                     try:
-                        cl = open(f"/proc/{old}/cmdline", "rb").read()
-                        if b"msgr" in cl:          # only ever kill a msgr listener
-                            os.kill(old, signal.SIGTERM)
-                            time.sleep(1)
-                    except (ProcessLookupError, FileNotFoundError, OSError,
-                            PermissionError):
+                        if b"msgr" in open(f"/proc/{holder}/cmdline", "rb").read():
+                            os.kill(holder, sig)  # only ever a msgr listener
+                    except (ProcessLookupError, FileNotFoundError, OSError):
                         pass
-            with open(lockfile, "w") as f:
-                f.write(str(os.getpid()))
-        except OSError:
-            pass
+
+            _signal(signal.SIGTERM)
+            deadline, forced = time.time() + 12, False
+            while not _try_lock():
+                if time.time() > deadline:
+                    if not forced:
+                        _signal(signal.SIGKILL)   # won't release → force it
+                        deadline, forced = time.time() + 5, True
+                    else:
+                        die(f"account '{self.env_name}': could not claim the "
+                            "sole-listener lock (another listener won't release)")
+                time.sleep(0.3)
+        lf.seek(0)
+        lf.truncate()
+        lf.write(str(os.getpid()))
+        lf.flush()
 
         while True:
             try:
