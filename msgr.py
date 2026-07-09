@@ -494,7 +494,33 @@ class Slack:
             import websocket
         except ImportError:
             die("websocket-client not installed (pip install 'msgr[listen]')")
+        import os
+        import signal
         import time
+
+        # Sole-listener guard. Socket mode delivers each event to exactly ONE
+        # open connection, so a second `listen` on the same account silently
+        # STEALS a share of events from the first (and a consumer blocked on
+        # its output goes intermittently deaf). Evict any prior listener for
+        # this account and claim ownership via a pidfile, so a restart or a
+        # stray listener can't accumulate into event-splitting.
+        lockfile = f"/tmp/.msgr-listen-{self.env_name}.pid"
+        try:
+            if os.path.exists(lockfile):
+                old = int((open(lockfile).read().strip() or "0"))
+                if old and old != os.getpid():
+                    try:
+                        cl = open(f"/proc/{old}/cmdline", "rb").read()
+                        if b"msgr" in cl:          # only ever kill a msgr listener
+                            os.kill(old, signal.SIGTERM)
+                            time.sleep(1)
+                    except (ProcessLookupError, FileNotFoundError, OSError,
+                            PermissionError):
+                        pass
+            with open(lockfile, "w") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
 
         while True:
             try:
