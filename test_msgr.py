@@ -553,24 +553,26 @@ class ContextCliTest(SpoolBase):
 
 
 class FollowSubprocessTest(SpoolBase):
-    def test_follow_streams_backlog_then_late_append(self):
+    """Drive `read --follow` as a real subprocess (posing as the ingester by
+    holding the sole-listener flock), appending a live event mid-stream."""
+
+    def _run_follow(self, consumer, flags, late, pre_sleep=1.3, timeout=3):
         cfg = self.tmp / "config.toml"
         cfg.write_text('[accounts.acct]\nplatform="slack"\n'
                        'bot_token="xoxb-fake"\n')
-        self.append("C", "first")
-        self.append("C", "second")
-
         lock = open("/tmp/.msgr-listen-acct.lock", "a+")
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # pose as the ingester
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
             env = dict(os.environ, MSGR_STATE_DIR=str(self.tmp),
                        MSGR_CONFIG=str(cfg))
             proc = subprocess.Popen(
                 [sys.executable, msgr.__file__, "read", "acct:*",
-                 "--as", "fol", "--follow", "--timeout", "3"],
+                 "--as", consumer, "--follow", *flags,
+                 "--timeout", str(timeout)],
                 env=env, stdout=subprocess.PIPE, text=True)
-            time.sleep(1.3)
-            self.append("C", "late")                  # arrives mid-stream
+            time.sleep(pre_sleep)
+            for t in late:
+                self.append("C", t)                   # arrives mid-stream
             out, _ = proc.communicate(timeout=20)
         finally:
             fcntl.flock(lock, fcntl.LOCK_UN)
@@ -579,13 +581,32 @@ class FollowSubprocessTest(SpoolBase):
                 os.unlink("/tmp/.msgr-listen-acct.lock")
             except OSError:
                 pass
-
         texts = [json.loads(ln)["text"]
                  for ln in out.splitlines() if ln.strip()]
-        self.assertEqual(texts, ["first", "second", "late"])  # backlog + live
-        self.assertEqual(proc.returncode, 0)          # stream ended on timeout
+        return texts, proc.returncode
+
+    def test_fresh_cursor_starts_from_now_no_backlog_replay(self):
+        # a week of retained backlog must NOT be replayed into a new follower
+        self.append("C", "old1")
+        self.append("C", "old2")
+        texts, rc = self._run_follow("fresh", [], ["live"])
+        self.assertEqual(texts, ["live"])             # only post-start events
+        self.assertEqual(rc, 0)
+
+    def test_existing_cursor_backfills_gap_then_tails(self):
+        self.append("C", "g1")                        # seq 1
+        self.append("C", "g2")                        # seq 2
+        msgr.spool_cursor_set("acct", "resume", 1)    # consumed through g1
+        texts, _ = self._run_follow("resume", [], ["g3"])
+        self.assertEqual(texts, ["g2", "g3"])         # gap backfilled, then live
+
+    def test_from_start_replays_backlog_then_tails(self):
+        self.append("C", "b1")
+        self.append("C", "b2")
+        texts, _ = self._run_follow("scratch", ["--from-start"], ["b3"])
+        self.assertEqual(texts, ["b1", "b2", "b3"])   # backlog + live
         # cursor advanced through every event: a fresh drain sees nothing
-        msgs, _, _ = msgr.spool_drain("acct", "fol", None)
+        msgs, _, _ = msgr.spool_drain("acct", "scratch", None)
         self.assertEqual(msgs, [])
 
 

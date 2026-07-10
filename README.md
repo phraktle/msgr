@@ -129,9 +129,12 @@ arrives during a restart/reconnect gap. The **spool** closes that gap:
 - `msgr read "acct:*" --as reception` consumes **every channel** of the account
   (a receptionist); `acct:#chan` filters to one channel. `--block` tails the
   spool live (returns after the first new batch; a fresh consumer starts "from
-  now"). `--follow` is a **continuous** stream: it emits the retained backlog,
-  then keeps tailing and prints each new event, advancing the cursor per event,
-  until `--timeout` (0 = forever) — a durable, resumable drop-in for `listen`.
+  now"). `--follow` is a **continuous** stream: it keeps tailing and prints
+  each new event, advancing the cursor per event, until `--timeout` (0 =
+  forever) — a durable, resumable drop-in for `listen`. Like `--block`, a
+  **fresh** cursor starts "from now" and an **existing** cursor resumes/
+  backfills the gap — a new follower never replays history. Add `--from-start`
+  to opt into emitting the retained backlog first, then tailing.
 - `--last N` and `--thread <ts>` are always direct one-shot API calls, never
   spooled.
 

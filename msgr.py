@@ -1320,10 +1320,14 @@ def main():
                    help="if nothing is new, block until messages arrive "
                         "(prints them, then returns; exit 3 on --timeout)")
     p.add_argument("--follow", action="store_true",
-                   help="continuous stream (spool): emit the backlog, then "
-                        "keep tailing and emit each new event, advancing the "
-                        "cursor per event, until --timeout (0 = forever). A "
-                        "durable, resumable drop-in for `listen`.")
+                   help="continuous stream (spool): keep tailing and emit each "
+                        "new event, advancing the cursor per event, until "
+                        "--timeout (0 = forever). Like --block, a fresh cursor "
+                        "starts 'from now' and an existing one resumes/backfills "
+                        "— never replays history. Durable drop-in for `listen`.")
+    p.add_argument("--from-start", dest="from_start", action="store_true",
+                   help="with --follow/--block: don't skip history on a fresh "
+                        "cursor — emit the retained backlog first, then tail")
     p.add_argument("--timeout", type=int, default=0,
                    help="with --block/--follow: max seconds; 0 = forever")
     p.add_argument("--interval", type=int, default=10,
@@ -1596,10 +1600,13 @@ def main():
             return cl.read(k, t, cursor=cursor, files=not args.no_files,
                            limit=args.last or args.limit, **kw)
 
-        if args.block and not args.follow:
-            # --block starts "from now": initialize fresh cursors (spool and
-            # poll alike) so we never fire on old history. --follow instead
-            # emits the retained backlog first, so it must NOT skip history.
+        # Both --block and --follow start "from now" on a FRESH cursor (seed it
+        # to the current end so we never fire on old history) and resume/
+        # backfill on an existing one. This matters most for a --follow
+        # receptionist: on its very first start it must NOT replay up to a week
+        # of retained journal and re-route everything. --from-start opts into
+        # emitting the retained backlog first (then tailing).
+        if (args.block or args.follow) and not args.from_start:
             for en, _chans, _le in spool_groups:
                 if spool_cursor_get(en, args.consumer) is None:
                     spool_cursor_set(en, args.consumer, spool_max_seq(en))
