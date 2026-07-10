@@ -17,6 +17,7 @@ the platform's own syntax):
     robot:foo@bar.com    an email recipient (email accounts, when supported)
     robot:INBOX          a mail folder
     #ops  @alice  @      no account prefix = the default account
+    dl:*                 every channel of account "dl" (spool-backed read)
     standup              any alias from the config
 
 The default account is $MSGR_ACCOUNT, else `default_account` in the config,
@@ -45,6 +46,11 @@ Patterns (for agents):
     will read for itself): add --peek to the blocking read.
   * Slack thread replies are included by default (new replies are caught
     even under old thread parents); --no-threads for feed-style channels.
+  * Reliable real-time: run `msgr listen <account>` as an always-on ingester
+    (it appends every event to a durable per-account spool); `read --as`
+    auto-detects it and consumes the spool with its cursor, so a reader can
+    restart and backfill with no lost messages. No ingester -> read falls back
+    to on-demand history polling. `read "acct:*"` reads every channel.
   * To read a whole thread on demand — root + every historical reply, with
     reactions — pass its id: `read ADDR --thread <id>`. One-shot (no cursor):
     conversations.history only returns top-level timeline messages, so old
@@ -93,15 +99,218 @@ CONFIG_CANDIDATES = [
     "/etc/msgr/config.toml",
 ]
 STATE_DIR = pathlib.Path(
-    os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state"))
-) / "msgr"
+    os.environ.get("MSGR_STATE_DIR")
+    or os.path.join(
+        os.environ.get("XDG_STATE_HOME", os.path.expanduser("~/.local/state")),
+        "msgr")
+)
 
 FILE_CAP = 20 * 1024 * 1024  # skip attachment downloads larger than this
 FILES_ROOT = None  # set from config `files_dir` in main(); default under STATE_DIR
 
+# Spool tuning: rotate when a spool grows past MAX_LINES, keeping KEEP_LINES.
+SPOOL_MAX_LINES = 20000
+SPOOL_KEEP_LINES = 10000
+
 
 def files_root():
     return pathlib.Path(FILES_ROOT) if FILES_ROOT else STATE_DIR / "files"
+
+
+def _ensure_state_dir(path):
+    """Create `path` (and parents), then tighten the state root to 0700. The
+    state dir can hold session files / attachments / spools — keep it private."""
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        os.chmod(STATE_DIR, 0o700)
+    except OSError:
+        pass
+
+
+# ------------------------------------------------------------------ Spool
+#
+# The spool is a durable, append-only per-account event log that makes `listen`
+# an ingester and lets `read` backfill across restarts. Design invariants:
+#
+#   * ONE writer only: `listen` holds the exclusive sole-listener flock, so no
+#     lock is needed for appends. It keeps `_seq` in memory (seeded from the
+#     spool's current max on startup) and stamps a strictly-increasing,
+#     never-reused `_seq` on every line.
+#   * A spool line is the SAME normalized event dict read/listen emit, plus the
+#     internal `_seq`. Readers strip `_seq` before emitting, so the output
+#     schema is unchanged.
+#   * Rotation is atomic (temp file + os.replace): a concurrent reader that
+#     re-opens the path sees either the whole old file or the whole new one,
+#     never a truncated one. `_seq` continues across rotation because it lives
+#     in the content, not in a byte offset.
+
+
+def spool_path(account):
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", account)
+    return STATE_DIR / "spool" / f"{safe}.jsonl"
+
+
+def spool_iter(account):
+    """Yield each event dict in the account's spool, oldest first. Skips blank
+    and (defensively) unparseable lines. Opens fresh so rotation is handled."""
+    p = spool_path(account)
+    if not p.exists():
+        return
+    with open(p, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+
+def spool_max_seq(account):
+    """The highest `_seq` currently in the spool (0 if empty/absent)."""
+    last = 0
+    for e in spool_iter(account):
+        s = e.get("_seq")
+        if isinstance(s, int):
+            last = s
+    return last
+
+
+class Spool:
+    """Single-writer append-only log for one account. Only `listen` (which
+    already holds the sole-listener flock) constructs this, so appends need no
+    lock. `_seq` is seeded from the spool's current max and only ever grows."""
+
+    def __init__(self, account, max_lines=None, keep_lines=None):
+        self.account = account
+        self.path = spool_path(account)
+        self.max_lines = max_lines or SPOOL_MAX_LINES
+        self.keep_lines = keep_lines or SPOOL_KEEP_LINES
+        _ensure_state_dir(self.path.parent)
+        # Seed _seq from the current max and count lines for rotation.
+        self._seq = 0
+        self._lines = 0
+        if self.path.exists():
+            with open(self.path, encoding="utf-8") as f:
+                for line in f:
+                    if not line.strip():
+                        continue
+                    self._lines += 1
+                    try:
+                        s = json.loads(line).get("_seq")
+                        if isinstance(s, int) and s > self._seq:
+                            self._seq = s
+                    except json.JSONDecodeError:
+                        pass
+
+    def append(self, entry):
+        """Stamp the next `_seq`, append one JSON line, flush. Returns the
+        assigned `_seq`. Rotates when the spool outgrows max_lines."""
+        self._seq += 1
+        rec = dict(entry)
+        rec["_seq"] = self._seq
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            f.flush()
+        self._lines += 1
+        if self._lines > self.max_lines:
+            self._rotate()
+        return self._seq
+
+    def _rotate(self):
+        """Rewrite the spool keeping the last keep_lines, atomically. `_seq`
+        values are preserved (they travel in the content)."""
+        with open(self.path, encoding="utf-8") as f:
+            lines = [ln for ln in f if ln.strip()]
+        keep = lines[-self.keep_lines:]
+        tmp = self.path.parent / f"{self.path.name}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.writelines(keep)
+            f.flush()
+        os.replace(tmp, self.path)  # atomic: readers never see a partial file
+        self._lines = len(keep)
+
+
+def spool_cursor_path(account, consumer):
+    sa = re.sub(r"[^A-Za-z0-9._-]", "_", account)
+    sc = re.sub(r"[^A-Za-z0-9._-]", "_", consumer)
+    return STATE_DIR / "cursors" / sa / f"{sc}.json"
+
+
+def spool_cursor_get(account, consumer):
+    """Last consumed `_seq` for this (account, consumer), or None if the
+    consumer has never read (distinguishes 'fresh' from 'consumed up to 0')."""
+    p = spool_cursor_path(account, consumer)
+    if not p.exists():
+        return None
+    try:
+        return int(json.loads(p.read_text()).get("seq", 0))
+    except (ValueError, json.JSONDecodeError, OSError):
+        return None
+
+
+def spool_cursor_set(account, consumer, seq):
+    p = spool_cursor_path(account, consumer)
+    _ensure_state_dir(p.parent)
+    tmp = p.parent / f"{p.name}.tmp.{os.getpid()}"
+    tmp.write_text(json.dumps({"seq": int(seq)}))
+    os.replace(tmp, p)  # atomic cursor advance
+
+
+def spool_drain(account, consumer, channels):
+    """Read new spool lines for one consumer.
+
+    `channels`: a set of channel ids to emit, or None for every channel.
+    Returns (msgs, new_cursor, warned):
+      * msgs         emitted event dicts (with `_seq` stripped), oldest first,
+                     filtered to `channels`, only `_seq > cursor`.
+      * new_cursor   max emitted `_seq` (== old cursor if nothing emitted).
+      * warned       True if the consumer's cursor fell off the front of the
+                     spool after rotation (gap between cursor and oldest
+                     retained line) — caller should warn; we emit from oldest.
+    """
+    cursor = spool_cursor_get(account, consumer)
+    cur = cursor or 0
+    msgs, min_seq, new_cursor = [], None, cur
+    for e in spool_iter(account):
+        s = e.get("_seq", 0)
+        if min_seq is None:
+            min_seq = s
+        if s <= cur:
+            continue
+        if channels is not None and e.get("channel") not in channels:
+            continue
+        msgs.append({k: v for k, v in e.items() if k != "_seq"})
+        if s > new_cursor:
+            new_cursor = s
+    # Falloff: the consumer had a real prior cursor, but everything up to (and
+    # including) cursor+1 was rotated away — we can only resume from the oldest
+    # retained line. A fresh consumer (cursor is None) legitimately backfills
+    # the whole spool and must NOT warn.
+    warned = (cursor is not None and cursor > 0
+              and min_seq is not None and min_seq > cursor + 1)
+    return msgs, new_cursor, warned
+
+
+def ingester_active(account):
+    """True if a `listen` ingester is running for this account. Detected by
+    trying the sole-listener flock non-blocking: if it's held, an ingester is
+    alive (use the spool); if we can take it, none is (release, poll the API)."""
+    import fcntl
+    lockpath = f"/tmp/.msgr-listen-{account}.lock"
+    try:
+        f = open(lockpath, "a+")
+    except OSError:
+        return False
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, fcntl.LOCK_UN)  # we grabbed it => no ingester; let go
+        return False
+    except OSError:
+        return True  # held => ingester alive
+    finally:
+        f.close()
 
 
 def die(msg, code=1):
@@ -162,8 +371,12 @@ def resolve_addr(cfg, addr):
             die(f"unknown account '{acct}' in '{addr}'")
     else:
         acct, target = "", addr
-    if not target:
-        die(f"bad address '{addr}': empty target")
+    # Account-level address: every channel of the account (spool-backed read
+    # only — a receptionist consuming all channels). `dl:*` or bare `*` (and
+    # `dl:` with an empty target, as a convenience) mean the same thing.
+    if target in ("*", ""):
+        name, account = pick_account(cfg, acct or None)
+        return name, account, "*", "*"
     name, account = pick_account(cfg, acct or None)
     if target.startswith("#"):
         kind, t = "#", target[1:]
@@ -486,7 +699,28 @@ class Slack:
                  "private" if c.get("is_private") else "public")
                 for c in chans], note
 
-    def listen(self, text_out, only=None):
+    def _socket_entry(self, ev):
+        """Normalize one socket-mode message event into msgr's JSON schema —
+        the SAME shape as Slack._entry for a plain message (minus reactions/
+        files, which a live message event doesn't carry), so a spooled event
+        and a history read come out identically."""
+        uid = ev.get("user") or ev.get("bot_id")
+        ch = ev.get("channel")
+        m = {"account": self.env_name, "channel": ch,
+             "addr": f"{self.env_name}:{ch}",
+             "id": ev.get("ts"), "time": iso(ev.get("ts")),
+             "thread": ev.get("thread_ts"),
+             "from": self.username(uid), "user": uid,
+             "owner": bool(self.owner) and ev.get("user") == self.owner,
+             "text": ev.get("text", "")}
+        if self.trust:
+            m["trust"] = self.trust
+        return m
+
+    def listen(self, echo=False, text_out=False, only=None):
+        """Ingester: append every message event to the durable per-account
+        spool (the default job). With echo=True also print each event to stdout
+        (JSONL, or human-readable when text_out) for debugging."""
         if not self.app_token:
             die(f"account '{self.env_name}': listen needs app_token "
                 f"(Slack app-level token with connections:write)")
@@ -549,6 +783,11 @@ class Slack:
         lf.write(str(os.getpid()))
         lf.flush()
 
+        # Sole writer of the spool (guaranteed by the flock above): build it
+        # now so `_seq` is seeded from the current max — a restart continues
+        # the sequence, never resets it.
+        spool = Spool(self.env_name)
+
         while True:
             try:
                 req = urllib.request.Request(
@@ -558,6 +797,17 @@ class Slack:
                 if not resp.get("ok"):
                     die(f"apps.connections.open: {resp.get('error')}")
                 ws = websocket.create_connection(resp["url"], timeout=45)
+                # TODO(make-before-break): a recycle/reconnect closes the old
+                # socket before opening the new one, so events delivered in the
+                # gap are lost from the *socket*. The spool makes this survivable
+                # for readers (they backfill from their cursor across the gap
+                # only for events that WERE spooled), but a truly zero-gap
+                # recycle would open the new socket and start reading it before
+                # closing the old (Slack allows brief multi-connection for
+                # graceful restart). Left as a follow-up: it needs careful dedup
+                # of events that arrive on both sockets and must not risk the
+                # sole-writer/`_seq` invariant. The 15-min cap below bounds the
+                # staleness window in the meantime.
                 # Cap the connection's life. A socket-mode connection can go
                 # half-open — the TCP peer is gone but recv() just keeps timing
                 # out and ws.ping() "succeeds" writing into the void — and then
@@ -585,20 +835,13 @@ class Slack:
                         continue
                     if only is not None and ev.get("channel") not in only:
                         continue
-                    uid = ev.get("user") or ev.get("bot_id")
-                    ch = ev.get("channel")
-                    m = {"account": self.env_name, "channel": ch,
-                         "addr": f"{self.env_name}:{ch}",
-                         "id": ev.get("ts"), "time": iso(ev.get("ts")),
-                         "thread": ev.get("thread_ts"),
-                         "from": self.username(uid), "user": uid,
-                         "owner": bool(self.owner)
-                         and ev.get("user") == self.owner,
-                         "text": ev.get("text", "")}
-                    print(json.dumps(m, ensure_ascii=False) if not text_out
-                          else f"[{m['time']}] {m['channel']} "
-                               f"{m['from']}: {m['text']}",
-                          flush=True)
+                    m = self._socket_entry(ev)
+                    spool.append(m)  # durable: the default job
+                    if echo:
+                        print(json.dumps(m, ensure_ascii=False) if not text_out
+                              else f"[{m['time']}] {m['channel']} "
+                                   f"{m['from']}: {m['text']}",
+                              flush=True)
                 ws.close()
             except Exception as e:  # noqa: BLE001
                 print(f"msgr listen: reconnecting ({e})", file=sys.stderr)
@@ -901,10 +1144,14 @@ def main():
     p = sub.add_parser("list", help="list channels the bot can see")
     p.add_argument("account", nargs="?")
 
-    p = sub.add_parser("listen", help="stream messages as they arrive (Slack)")
+    p = sub.add_parser("listen", help="ingest messages into the durable spool "
+                       "(Slack Socket Mode); `read` backfills from it")
     p.add_argument("account", nargs="?")
+    p.add_argument("--print", dest="echo", action="store_true",
+                   help="also echo events to stdout (debug); spooling is the "
+                        "default job")
     p.add_argument("--text", action="store_true",
-                   help="human-readable output (default is JSONL)")
+                   help="with --print: human-readable output (default JSONL)")
 
     p = sub.add_parser("login", help="one-time interactive Telegram login")
     p.add_argument("account", nargs="?")
@@ -951,11 +1198,15 @@ def main():
                 en2, _e, k2, t2 = resolve_addr(cfg, a)
                 if en2 == name:
                     only.add(client.target_id(k2, t2))
-        client.listen(args.text, only=only)
+        client.listen(echo=args.echo or args.text, text_out=args.text,
+                      only=only)
         return
 
     if args.cmd in ("react", "send"):
         env_name, env, kind, target = resolve_addr(cfg, args.addr)
+        if kind == "*":
+            die(f"'{args.addr}' is an account-level address (all channels) — "
+                f"{args.cmd} needs a specific channel or person")
         client = platform_client(env_name, env)
         allow = env.get("allow_post", False)
         if isinstance(allow, list) and \
@@ -1012,18 +1263,61 @@ def main():
                 print(fmt(m) if args.text
                       else json.dumps(m, ensure_ascii=False))
             return
-        clients, targets = {}, []
+        clients, targets, by_acct = {}, [], {}
         for a in args.addrs:
             en, env, k, t = resolve_addr(cfg, a)
             if en not in clients:
                 clients[en] = platform_client(en, env)
             ar = env.get("allow_read")
-            if isinstance(ar, list) and \
+            # Account-level (`*`) scoping is applied as a channel filter in
+            # spool mode below; a specific address is checked here.
+            if k != "*" and isinstance(ar, list) and \
                     not scope_match(cfg, en, k, t, clients[en], ar):
                 die(f"'{a}' is not whitelisted in account '{en}' "
                     f"allow_read (config)")
             targets.append((a, en, clients[en], k, t))
+            by_acct.setdefault(en, {"env": env, "cl": clients[en],
+                                    "items": []})["items"].append((a, k, t))
         multi = len(targets) > 1
+
+        # Backend selection is PER ACCOUNT. `--last`/`--thread` are always
+        # direct API one-shots (never spool). Otherwise a Slack account whose
+        # ingester (`listen`) is running is read from the durable spool — a
+        # reader backfills from its cursor across restarts. Accounts with no
+        # ingester (e.g. a laptop with zero setup) keep the poll behavior.
+        direct_only = bool(args.last or args.thread)
+        spool_groups, poll_targets = [], []  # spool: (en, chans, label_each)
+        for en, g in by_acct.items():
+            cl, env = g["cl"], g["env"]
+            use_spool = (not direct_only and isinstance(cl, Slack)
+                         and ingester_active(en))
+            if not use_spool:
+                for a, k, t in g["items"]:
+                    poll_targets.append((a, en, cl, k, t))
+                continue
+            wildcard = any(k == "*" for _a, k, _t in g["items"])
+            chans = set()
+            for a, k, t in g["items"]:
+                if k != "*":
+                    chans.add(cl.target_id(k, t))
+            ar = env.get("allow_read")
+            if wildcard:
+                if isinstance(ar, list):
+                    # account-level under a read scope: restrict to the
+                    # allowed channels (canonical ids), never wider.
+                    allowed = set()
+                    for e in ar:
+                        en2, _e2, k2, t2 = resolve_addr(cfg, e)
+                        if en2 == en:
+                            allowed.add(cl.target_id(k2, t2))
+                    chan_filter = allowed
+                else:
+                    chan_filter = None  # every channel
+            else:
+                chan_filter = chans
+            label_each = wildcard or len(g["items"]) > 1
+            spool_groups.append((en, chan_filter, label_each))
+        have_spool = bool(spool_groups)
 
         def read_one(a, en, cl, k, t, cursor):
             kw = {"threads": not args.no_threads} \
@@ -1032,38 +1326,76 @@ def main():
                            limit=args.last or args.limit, **kw)
 
         if args.block:
-            # blocking starts "from now": initialize fresh cursors so we
-            # never fire on old history
-            for a, en, cl, k, t in targets:
+            # blocking starts "from now": initialize fresh cursors (spool and
+            # poll alike) so we never fire on old history.
+            for en, _chans, _le in spool_groups:
+                if spool_cursor_get(en, args.consumer) is None:
+                    spool_cursor_set(en, args.consumer, spool_max_seq(en))
+            for a, en, cl, k, t in poll_targets:
                 if cursor_get(args.consumer, en, k, t) is None:
                     _, nc = read_one(a, en, cl, k, t, None)
                     if nc:
                         cursor_set(args.consumer, en, k, t, nc)
 
-        deadline = time.time() + args.timeout if args.timeout else None
-        while True:
-            results, any_new = [], False
-            for a, en, cl, k, t in targets:
-                cursor = None if args.last \
-                    else cursor_get(args.consumer, en, k, t)
-                msgs, nc = read_one(a, en, cl, k, t, cursor)
-                if args.last:
-                    msgs = msgs[-args.last:]
-                elif cursor is None:
-                    msgs = msgs[-20:]  # first contact: don't dump history
-                any_new = any_new or bool(msgs)
-                results.append((a, en, k, t, msgs, nc))
-            if any_new or not args.block:
-                for a, en, k, t, msgs, nc in results:
+        warned = set()
+
+        def collect(do_poll):
+            emit, advances, any_new = [], [], False
+            for en, chans, label_each in spool_groups:
+                msgs, nc, warn = spool_drain(en, args.consumer, chans)
+                if warn and en not in warned:
+                    warned.add(en)
+                    print(f"msgr: warning: consumer '{args.consumer}' fell "
+                          f"behind the spool for account '{en}' — some events "
+                          f"were rotated out; resuming from the oldest "
+                          f"retained event", file=sys.stderr)
+                for m in msgs:
+                    emit.append((m, m.get("addr")
+                                 if (multi or label_each) else None))
+                if msgs:
+                    any_new = True
+                    if not args.peek:
+                        advances.append(
+                            lambda en=en, nc=nc:
+                            spool_cursor_set(en, args.consumer, nc))
+            if do_poll:
+                for a, en, cl, k, t in poll_targets:
+                    cursor = None if args.last \
+                        else cursor_get(args.consumer, en, k, t)
+                    msgs, nc = read_one(a, en, cl, k, t, cursor)
+                    if args.last:
+                        msgs = msgs[-args.last:]
+                    elif cursor is None:
+                        msgs = msgs[-20:]  # first contact: don't dump history
                     for m in msgs:
-                        print(fmt(m, a if multi else None) if args.text
-                              else json.dumps(m, ensure_ascii=False))
+                        emit.append((m, a if multi else None))
+                    if msgs:
+                        any_new = True
                     if not args.peek and not args.last and nc:
-                        cursor_set(args.consumer, en, k, t, nc)
+                        advances.append(
+                            lambda en=en, k=k, t=t, nc=nc:
+                            cursor_set(args.consumer, en, k, t, nc))
+            return emit, advances, any_new
+
+        deadline = time.time() + args.timeout if args.timeout else None
+        tail = 0.4  # snappy spool tail; poll accounts stay on --interval
+        next_poll = 0.0
+        while True:
+            now = time.time()
+            do_poll = (not args.block) or now >= next_poll
+            if do_poll:
+                next_poll = now + args.interval
+            emit, advances, any_new = collect(do_poll)
+            if any_new or not args.block:
+                for m, label in emit:
+                    print(fmt(m, label) if args.text
+                          else json.dumps(m, ensure_ascii=False))
+                for adv in advances:
+                    adv()
                 return
             if deadline and time.time() >= deadline:
                 sys.exit(3)
-            time.sleep(args.interval)
+            time.sleep(tail if have_spool else args.interval)
 
 
 if __name__ == "__main__":

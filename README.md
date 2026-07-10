@@ -24,7 +24,8 @@ msgr read "#alerts" "#ops" --as watcher --block --timeout 3600
                                                 # address has new messages,
                                                 # print them (exit 3: timeout)
 msgr list                                   # what the bot can see
-msgr listen --json                              # stream messages (Socket Mode)
+msgr listen                                     # ingest into the durable spool
+msgr read "acct:*" --as reception --block       # backfill-able read of ALL channels
 msgr react "#ops" 1712345678.123 white_check_mark
 msgr login news                              # one-time Telegram session setup
 ```
@@ -43,6 +44,7 @@ tg:-100123456        Telegram chat by numeric ID
 robot:foo@bar.com    email recipient (email accounts, when supported)
 robot:INBOX          mail folder
 #ops  @alice  @      no prefix = the default account
+dl:*                 EVERY channel of an account (spool-backed read only)
 standup              any alias from the config
 ```
 
@@ -107,6 +109,42 @@ allow_post = true                      # whole account writable
 [accounts.other]
 allow_post = ["#ops", "@alice"]        # only these addresses
 ```
+
+## Durable spool (reliable real-time reads)
+
+`read` polls an account's history on demand — great with zero setup, but a
+consumer reading the raw real-time socket (`listen`) loses any message that
+arrives during a restart/reconnect gap. The **spool** closes that gap:
+
+- Run `msgr listen <account>` as an always-on **ingester**. Instead of printing
+  events, it appends every one to a durable, append-only per-account log (add
+  `--print` to also echo to stdout for debugging). The sole-listener flock
+  guarantees exactly one writer.
+- `read <addr…> --as <name>` then **auto-detects** the ingester (via that same
+  flock) and reads from the spool with its per-consumer cursor. A reader can
+  restart and **backfill** from where it left off — nothing is silently lost.
+  If no ingester is running, `read` falls back to the on-demand history poll
+  (unchanged), so `msgr read --last 10` on a laptop still works with no setup.
+- `msgr read "acct:*" --as reception` consumes **every channel** of the account
+  (a receptionist); `acct:#chan` filters to one channel. `--block` tails the
+  spool live; a fresh consumer under `--block` starts "from now".
+- `--last N` and `--thread <ts>` are always direct one-shot API calls, never
+  spooled.
+
+Layout (under the state dir — `$MSGR_STATE_DIR`, else
+`~/.local/state/msgr`, created `0700`):
+
+```
+<state>/spool/<account>.jsonl        append-only log; each line is a normal
+                                     read entry + an internal "_seq"
+<state>/cursors/<account>/<name>.json  per-consumer last-consumed _seq
+```
+
+`_seq` is a strictly-increasing, never-reused integer. The spool auto-rotates
+(keeping the most recent lines) once it grows past a cap; `_seq` continues
+across rotation. If a consumer falls so far behind that its cursor was rotated
+away, `read` prints a one-line warning to stderr and resumes from the oldest
+retained event (never silently skips, never errors).
 
 ## Message schema
 
