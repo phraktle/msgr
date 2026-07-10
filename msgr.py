@@ -666,7 +666,10 @@ class Slack:
         chan = self.target_id(kind, target) if kind == "@" else \
             (target if target.startswith("#")
              or re.fullmatch(r"[CGD][A-Z0-9]{8,}", target) else "#" + target)
-        params = {"channel": chan, "text": text}
+        # no link previews: a CLI bot's links are references (PRs, permalinks,
+        # dashboards) — unfurl cards just bloat the channel.
+        params = {"channel": chan, "text": text,
+                  "unfurl_links": False, "unfurl_media": False}
         if thread:
             params["thread_ts"] = thread
         resp = self.api("chat.postMessage", **params)
