@@ -13,8 +13,10 @@ import os
 import pathlib
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -126,7 +128,10 @@ class SpoolBase(unittest.TestCase):
         msgr.STATE_DIR = self._saved_state
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def event(self, channel, text, ts="1.0", user="U0BOB", **extra):
+    def event(self, channel, text, ts=None, user="U0BOB", **extra):
+        # default to "now" so retention (7-day window) doesn't drop test events
+        if ts is None:
+            ts = f"{time.time():.4f}"
         e = {"account": "acct", "channel": channel,
              "addr": f"acct:{channel}", "id": ts, "time": msgr.iso(ts),
              "thread": None, "from": "bob", "user": user,
@@ -279,6 +284,59 @@ class SpoolFalloffTest(SpoolBase):
         self.assertEqual(nc, 11)
 
 
+class SpoolRetentionTest(SpoolBase):
+    def test_old_events_dropped_on_rotation_seq_and_cursor(self):
+        sp = msgr.Spool("acct", max_lines=8, keep_lines=100, retention_days=7)
+        now = time.time()
+        old, recent = now - 10 * 86400, now - 1 * 86400
+        for i in range(5):
+            sp.append(self.event("C1", f"old{i}", ts=f"{old + i:.4f}"))
+        for i in range(4):                              # 9th append -> rotation
+            sp.append(self.event("C1", f"new{i}", ts=f"{recent + i:.4f}"))
+
+        lines = self.raw_lines()
+        self.assertEqual([e["text"] for e in lines],
+                         ["new0", "new1", "new2", "new3"])  # old dropped by age
+        self.assertEqual([e["_seq"] for e in lines], [6, 7, 8, 9])  # seq rises
+        self.assertEqual(sp._seq, 9)
+
+        # a within-window cursor (read up to new0 = seq 6) resumes with no gap
+        msgr.spool_cursor_set("acct", "w", 6)
+        msgs, nc, warn = msgr.spool_drain("acct", "w", None)
+        self.assertFalse(warn)
+        self.assertEqual([m["text"] for m in msgs], ["new1", "new2", "new3"])
+        self.assertEqual(nc, 9)
+
+    def test_periodic_prune_during_append_without_size_rotation(self):
+        """The cheap periodic check prunes stale events even when the size cap
+        is nowhere near — the common low-volume case."""
+        sp = msgr.Spool("acct", max_lines=100000, keep_lines=100000,
+                        retention_days=7)
+        sp.PRUNE_EVERY = 3
+        old = time.time() - 10 * 86400
+        sp.append(self.event("C1", "old0", ts=f"{old:.4f}"))
+        sp.append(self.event("C1", "old1", ts=f"{old + 1:.4f}"))
+        sp.append(self.event("C1", "new", ts=f"{time.time():.4f}"))  # triggers
+        self.assertEqual([e["text"] for e in self.raw_lines()], ["new"])
+        self.assertEqual(sp._seq, 3)                    # seq unaffected by prune
+
+    def test_seq_survives_prune_to_empty_across_restart(self):
+        """If retention prunes the whole spool (no traffic for > the window),
+        a restarted ingester must NOT reset `_seq` — a persisted high-water
+        mark keeps it monotonic so no consumer cursor is silently overtaken."""
+        sp = msgr.Spool("acct", max_lines=3, keep_lines=100, retention_days=7)
+        old = time.time() - 10 * 86400
+        for i in range(4):                    # >3 -> rotation; all old -> empty
+            sp.append(self.event("C1", f"o{i}", ts=f"{old + i:.4f}"))
+        self.assertEqual(self.raw_lines(), [])          # journal pruned to empty
+        self.assertEqual(sp._seq, 4)
+        self.assertEqual(msgr.spool_hwm_get("acct"), 4)
+        # "restart": a fresh Spool reseeds from the high-water mark, not 0
+        self.assertEqual(msgr.Spool("acct")._seq, 4)
+        self.assertEqual(msgr.Spool("acct").append(self.event("C1", "fresh")),
+                         5)
+
+
 class BackendDecisionTest(SpoolBase):
     def test_ingester_active_reflects_flock(self):
         acct = "acct"
@@ -390,11 +448,145 @@ class ReadSpoolCliTest(SpoolBase):
     def test_falloff_warns_on_stderr(self):
         sp = msgr.Spool("acct", max_lines=6, keep_lines=3)
         for i in range(7):
-            sp.append(self.event("Cops", f"m{i}", ts=f"{i}.0"))
+            sp.append(self.event("Cops", f"m{i}"))  # recent ts (size rotation)
         msgr.spool_cursor_set("acct", "slow", 1)   # below retained min
         out, err, _ = self.run_read(["acct:*", "--as", "slow"])
         self.assertIn("fell behind", err)
         self.assertTrue(self.jsonl(out))            # still emits, no crash
+
+
+class ParseSinceTest(unittest.TestCase):
+    def test_relative_today_and_iso(self):
+        now = time.time()
+        self.assertAlmostEqual(msgr.parse_since("1d"), now - 86400, delta=5)
+        self.assertAlmostEqual(msgr.parse_since("2h"), now - 7200, delta=5)
+        self.assertIsNone(msgr.parse_since(None))
+        # today = midnight UTC, within the last 24h
+        t = msgr.parse_since("today")
+        self.assertTrue(now - 86400 <= t <= now)
+        # ISO date
+        self.assertEqual(msgr.parse_since("2026-01-02"),
+                         __import__("datetime").datetime(
+                             2026, 1, 2,
+                             tzinfo=__import__("datetime").timezone.utc)
+                         .timestamp())
+
+
+class ContextCliTest(SpoolBase):
+    CFG = {"accounts": {"acct": {"platform": "slack", "bot_token": "x"}}}
+
+    def run_ctx(self, argv, cfg=None):
+        cfg = cfg or self.CFG
+        with mock.patch.object(msgr, "load_config", return_value=cfg), \
+             mock.patch.object(msgr, "platform_client",
+                               side_effect=lambda en, env:
+                               FakeSlackRead(en, env)), \
+             mock.patch.object(sys, "argv", ["msgr", "context"] + argv):
+            buf, err = io.StringIO(), io.StringIO()
+            code = 0
+            try:
+                with contextlib.redirect_stdout(buf), \
+                        contextlib.redirect_stderr(err):
+                    msgr.main()
+            except SystemExit as e:
+                code = e.code or 0
+            return buf.getvalue(), err.getvalue(), code
+
+    def _seed(self):
+        # a small journal: a thread in #ops, an owner message, an attachment
+        self.append("Cops", "deploy?", ts="100.1")
+        self.append("Cops", "done", ts="100.2", thread="100.1")
+        self.append("Cops", "ship it", ts="100.3", user="U0OWNER",
+                    owner=True, **{"from": "chief"})
+        self.append("Calerts", "disk full", ts="200.1", files=["report.pdf"])
+
+    def test_grouped_by_channel_threads_nested_owner_attachment(self):
+        self._seed()
+        msgr.name_cache_set("acct", "ops", "Cops")   # resolvable label
+        out, _, _ = self.run_ctx(["acct:*"])
+        self.assertIn("## #ops", out)                 # readable label from cache
+        self.assertIn("(Cops)", out)
+        self.assertIn("## Calerts", out)              # id label (no cache entry)
+        self.assertIn("↳", out)                       # reply nested under root
+        # reply comes after its root and is indented under it
+        self.assertLess(out.index("deploy?"), out.index("done"))
+        done_line = [ln for ln in out.splitlines() if "done" in ln][0]
+        self.assertTrue(done_line.startswith("  ↳ "))  # nested reply marker
+        self.assertIn("chief (owner):", out)          # owner marked
+        self.assertIn("[attachment: report.pdf]", out)  # referenced, not inlined
+        self.assertNotIn('"files"', out)              # not raw JSON
+
+    def test_since_filters(self):
+        self.append("Cops", "stale", ts=f"{time.time() - 2 * 86400:.4f}")
+        self.append("Cops", "recent", ts=f"{time.time():.4f}")
+        out, _, _ = self.run_ctx(["acct:*", "--since", "1d"])
+        self.assertIn("recent", out)
+        self.assertNotIn("stale", out)
+
+    def test_channel_filter(self):
+        self._seed()
+        out, _, _ = self.run_ctx(["acct:#ops"])       # -> target_id "Cops"
+        self.assertIn("deploy?", out)
+        self.assertNotIn("disk full", out)            # #alerts excluded
+
+    def test_thread_filter(self):
+        self._seed()
+        out, _, _ = self.run_ctx(["acct:*", "--thread", "100.1"])
+        self.assertIn("deploy?", out)                 # root
+        self.assertIn("done", out)                    # its reply
+        self.assertNotIn("ship it", out)              # other message excluded
+        self.assertNotIn("disk full", out)
+
+    def test_json_emits_raw_filtered_events(self):
+        self._seed()
+        out, _, _ = self.run_ctx(["acct:#ops", "--json"])
+        recs = [json.loads(ln) for ln in out.splitlines() if ln.strip()]
+        self.assertEqual([r["text"] for r in recs],
+                         ["deploy?", "done", "ship it"])
+        self.assertTrue(all("_seq" not in r for r in recs))  # _seq stripped
+
+    def test_no_local_record_note(self):
+        out, err, code = self.run_ctx(["acct:*"])     # no spool written
+        self.assertEqual(out, "")
+        self.assertIn("no local record", err)
+        self.assertEqual(code, 0)
+
+
+class FollowSubprocessTest(SpoolBase):
+    def test_follow_streams_backlog_then_late_append(self):
+        cfg = self.tmp / "config.toml"
+        cfg.write_text('[accounts.acct]\nplatform="slack"\n'
+                       'bot_token="xoxb-fake"\n')
+        self.append("C", "first")
+        self.append("C", "second")
+
+        lock = open("/tmp/.msgr-listen-acct.lock", "a+")
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)  # pose as the ingester
+        try:
+            env = dict(os.environ, MSGR_STATE_DIR=str(self.tmp),
+                       MSGR_CONFIG=str(cfg))
+            proc = subprocess.Popen(
+                [sys.executable, msgr.__file__, "read", "acct:*",
+                 "--as", "fol", "--follow", "--timeout", "3"],
+                env=env, stdout=subprocess.PIPE, text=True)
+            time.sleep(1.3)
+            self.append("C", "late")                  # arrives mid-stream
+            out, _ = proc.communicate(timeout=20)
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+            try:
+                os.unlink("/tmp/.msgr-listen-acct.lock")
+            except OSError:
+                pass
+
+        texts = [json.loads(ln)["text"]
+                 for ln in out.splitlines() if ln.strip()]
+        self.assertEqual(texts, ["first", "second", "late"])  # backlog + live
+        self.assertEqual(proc.returncode, 0)          # stream ended on timeout
+        # cursor advanced through every event: a fresh drain sees nothing
+        msgs, _, _ = msgr.spool_drain("acct", "fol", None)
+        self.assertEqual(msgs, [])
 
 
 if __name__ == "__main__":

@@ -25,7 +25,8 @@ msgr read "#alerts" "#ops" --as watcher --block --timeout 3600
                                                 # print them (exit 3: timeout)
 msgr list                                   # what the bot can see
 msgr listen                                     # ingest into the durable spool
-msgr read "acct:*" --as reception --block       # backfill-able read of ALL channels
+msgr read "acct:*" --as reception --follow      # durable, resumable live stream
+msgr context "acct:*" --since 1d                # readable digest of recent chat
 msgr react "#ops" 1712345678.123 white_check_mark
 msgr login news                              # one-time Telegram session setup
 ```
@@ -127,9 +128,42 @@ arrives during a restart/reconnect gap. The **spool** closes that gap:
   (unchanged), so `msgr read --last 10` on a laptop still works with no setup.
 - `msgr read "acct:*" --as reception` consumes **every channel** of the account
   (a receptionist); `acct:#chan` filters to one channel. `--block` tails the
-  spool live; a fresh consumer under `--block` starts "from now".
+  spool live (returns after the first new batch; a fresh consumer starts "from
+  now"). `--follow` is a **continuous** stream: it emits the retained backlog,
+  then keeps tailing and prints each new event, advancing the cursor per event,
+  until `--timeout` (0 = forever) — a durable, resumable drop-in for `listen`.
 - `--last N` and `--thread <ts>` are always direct one-shot API calls, never
   spooled.
+
+The journal doubles as ~a week of **situational-awareness memory**: it is
+**time-retained** (`SPOOL_RETENTION_DAYS`, default 7 — tunable). Rotation drops
+events older than the window (and caps size); `_seq` stays strictly increasing
+across the prune (a persisted high-water mark survives even a prune-to-empty),
+so cursors are never silently overtaken.
+
+## `context` — situational-awareness digest
+
+`msgr context [address] [--since <spec>]` renders the journal as a compact,
+human/agent-readable digest (not JSONL) — load "what's going on in the chats"
+in one shot. It reads the spool (offline, complete incl. thread replies).
+
+```bash
+msgr context "acct:*"                 # all channels, everything retained (~week)
+msgr context "acct:#ops" --since 1d   # one channel, last day
+msgr context "acct:*" --since today
+msgr context "acct:*" --thread 1712345678.123   # zoom into one thread
+msgr context "acct:*" --json          # filtered raw events (JSONL) for scripts
+```
+
+- Address grammar mirrors `read`: `acct:*` / `acct:` = all channels;
+  `acct:#chan` = one channel; omitted = default account, all channels.
+- `--since` accepts `7d` / `1d` / `2h` / `today` / `YYYY-MM-DD`; default is
+  everything retained.
+- Rendering groups by channel (readable `#name` when cached, else the id),
+  orders chronologically, **nests thread replies** under their parent, marks
+  the `(owner)`, and shows attachments as `[attachment: <name>]` — referenced,
+  never inlined. If no journal exists yet, it prints a one-line note (run
+  `msgr listen <account>` to start one).
 
 Layout (under the state dir — `$MSGR_STATE_DIR`, else
 `~/.local/state/msgr`, created `0700`):

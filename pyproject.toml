@@ -1,6 +1,6 @@
 [project]
 name = "msgr"
-version = "0.6.0"
+version = "0.7.0"
 description = "Minimal multi-platform channel mailbox CLI (Slack, Telegram) for LLM agents and scripts"
 requires-python = ">=3.11"
 

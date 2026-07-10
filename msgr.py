@@ -51,6 +51,12 @@ Patterns (for agents):
     auto-detects it and consumes the spool with its cursor, so a reader can
     restart and backfill with no lost messages. No ingester -> read falls back
     to on-demand history polling. `read "acct:*"` reads every channel.
+    `read ... --follow` is a continuous, resumable stream (drop-in for listen);
+    `--block` is the one-shot wake+data variant.
+  * `msgr context [addr] [--since 7d]` renders the spool journal (which is also
+    ~a week of retained situational-awareness memory) as a readable digest:
+    grouped by channel, thread replies nested, attachments referenced. Add
+    --json for the filtered raw events.
   * To read a whole thread on demand — root + every historical reply, with
     reactions — pass its id: `read ADDR --thread <id>`. One-shot (no cursor):
     conversations.history only returns top-level timeline messages, so old
@@ -90,6 +96,7 @@ import pathlib
 import re
 import socket
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -109,8 +116,13 @@ FILE_CAP = 20 * 1024 * 1024  # skip attachment downloads larger than this
 FILES_ROOT = None  # set from config `files_dir` in main(); default under STATE_DIR
 
 # Spool tuning: rotate when a spool grows past MAX_LINES, keeping KEEP_LINES.
+# Additionally, prune events older than SPOOL_RETENTION_DAYS. The journal thus
+# holds roughly min(size cap, retention window) — at low volume the ~7-day
+# window is the binding constraint and stays well under the line cap. All three
+# are tunable.
 SPOOL_MAX_LINES = 20000
 SPOOL_KEEP_LINES = 10000
+SPOOL_RETENTION_DAYS = 7
 
 
 def files_root():
@@ -150,6 +162,49 @@ def spool_path(account):
     return STATE_DIR / "spool" / f"{safe}.jsonl"
 
 
+def spool_hwm_path(account):
+    """Sidecar holding the highest `_seq` ever assigned. Retention can prune
+    the whole spool to empty (no traffic for > the window); this preserves the
+    high-water mark so a restarted ingester never RESETS `_seq` and a consumer
+    cursor can't be silently overtaken by a reused sequence number."""
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", account)
+    return STATE_DIR / "spool" / f"{safe}.seq"
+
+
+def spool_hwm_get(account):
+    try:
+        return int(spool_hwm_path(account).read_text().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def spool_hwm_set(account, seq):
+    p = spool_hwm_path(account)
+    _ensure_state_dir(p.parent)
+    tmp = p.parent / f"{p.name}.tmp.{os.getpid()}"
+    tmp.write_text(str(int(seq)))
+    os.replace(tmp, p)
+
+
+def event_epoch(e):
+    """Best-effort UTC epoch seconds for a spooled event, from its `id` (Slack
+    ts is epoch) or its ISO `time`. None if undeterminable (then never pruned
+    on age — we don't drop what we can't date)."""
+    try:
+        return float(e.get("id"))
+    except (TypeError, ValueError):
+        pass
+    t = e.get("time")
+    if t:
+        from datetime import datetime, timezone
+        try:
+            return datetime.strptime(t, "%Y-%m-%dT%H:%M:%SZ")\
+                .replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            pass
+    return None
+
+
 def spool_iter(account):
     """Yield each event dict in the account's spool, oldest first. Skips blank
     and (defensively) unparseable lines. Opens fresh so rotation is handled."""
@@ -182,15 +237,21 @@ class Spool:
     already holds the sole-listener flock) constructs this, so appends need no
     lock. `_seq` is seeded from the spool's current max and only ever grows."""
 
-    def __init__(self, account, max_lines=None, keep_lines=None):
+    PRUNE_EVERY = 256  # cheap age check cadence (appends) between size rotations
+
+    def __init__(self, account, max_lines=None, keep_lines=None,
+                 retention_days=None):
         self.account = account
         self.path = spool_path(account)
         self.max_lines = max_lines or SPOOL_MAX_LINES
         self.keep_lines = keep_lines or SPOOL_KEEP_LINES
+        self.retention_days = (retention_days if retention_days is not None
+                               else SPOOL_RETENTION_DAYS)
         _ensure_state_dir(self.path.parent)
         # Seed _seq from the current max and count lines for rotation.
         self._seq = 0
         self._lines = 0
+        self._since_prune = 0
         if self.path.exists():
             with open(self.path, encoding="utf-8") as f:
                 for line in f:
@@ -203,10 +264,14 @@ class Spool:
                             self._seq = s
                     except json.JSONDecodeError:
                         pass
+        # Never regress below the persisted high-water mark: retention may have
+        # pruned the spool to empty since the last run.
+        self._seq = max(self._seq, spool_hwm_get(account))
 
     def append(self, entry):
         """Stamp the next `_seq`, append one JSON line, flush. Returns the
-        assigned `_seq`. Rotates when the spool outgrows max_lines."""
+        assigned `_seq`. Rotates on the size cap; between rotations a cheap
+        periodic check prunes events older than the retention window."""
         self._seq += 1
         rec = dict(entry)
         rec["_seq"] = self._seq
@@ -214,22 +279,62 @@ class Spool:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
             f.flush()
         self._lines += 1
+        self._since_prune += 1
         if self._lines > self.max_lines:
             self._rotate()
+        elif self._since_prune >= self.PRUNE_EVERY:
+            self._since_prune = 0
+            self._prune_if_stale()  # cheap: only rewrites if the oldest is old
         return self._seq
 
-    def _rotate(self):
-        """Rewrite the spool keeping the last keep_lines, atomically. `_seq`
-        values are preserved (they travel in the content)."""
+    def _cutoff(self):
+        return time.time() - self.retention_days * 86400
+
+    def _prune_if_stale(self):
+        """Rewrite only if the OLDEST retained event is out of the retention
+        window (reads just the first line — no full scan on the common path)."""
+        first = None
         with open(self.path, encoding="utf-8") as f:
-            lines = [ln for ln in f if ln.strip()]
-        keep = lines[-self.keep_lines:]
+            for line in f:
+                if line.strip():
+                    first = line
+                    break
+        if not first:
+            return
+        try:
+            ep = event_epoch(json.loads(first))
+        except json.JSONDecodeError:
+            return
+        if ep is not None and ep < self._cutoff():
+            self._rotate()
+
+    def _rotate(self):
+        """Rewrite the spool atomically, dropping events older than the
+        retention window and then capping to keep_lines. `_seq` values are
+        preserved (they travel in the content), and the high-water mark is
+        persisted so a later prune-to-empty can't reset the sequence."""
+        cutoff = self._cutoff()
+        kept = []
+        with open(self.path, encoding="utf-8") as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    ep = event_epoch(json.loads(line))
+                except json.JSONDecodeError:
+                    kept.append(line)  # undatable/garbage: keep, don't lose it
+                    continue
+                if ep is not None and ep < cutoff:
+                    continue  # older than the retention window: drop
+                kept.append(line)
+        kept = kept[-self.keep_lines:]  # then honor the size cap
         tmp = self.path.parent / f"{self.path.name}.tmp.{os.getpid()}"
         with open(tmp, "w", encoding="utf-8") as f:
-            f.writelines(keep)
+            f.writelines(ln if ln.endswith("\n") else ln + "\n" for ln in kept)
             f.flush()
         os.replace(tmp, self.path)  # atomic: readers never see a partial file
-        self._lines = len(keep)
+        self._lines = len(kept)
+        spool_hwm_set(self.account, self._seq)
 
 
 def spool_cursor_path(account, consumer):
@@ -715,6 +820,10 @@ class Slack:
              "text": ev.get("text", "")}
         if self.trust:
             m["trust"] = self.trust
+        # Reference attachments by name (don't download in the ingester); a
+        # reader/`context` renders them as [attachment: <name>], not inlined.
+        if ev.get("files"):
+            m["files"] = [f.get("name") or "file" for f in ev["files"]]
         return m
 
     def listen(self, echo=False, text_out=False, only=None):
@@ -731,7 +840,6 @@ class Slack:
         import fcntl
         import os
         import signal
-        import time
 
         # Sole-listener GUARANTEE. Socket mode delivers each event to exactly
         # ONE of an app's open connections (Slack distributes, never
@@ -1078,6 +1186,100 @@ class ClaudeCode:
 
 # ------------------------------------------------------------------ CLI
 
+def parse_since(spec):
+    """A `--since` spec -> UTC epoch-seconds cutoff (events at/after it are
+    kept), or None for 'no lower bound'. Accepts `<N>d`/`<N>h`/`<N>m`,
+    `today`, an ISO date `YYYY-MM-DD`, or an ISO datetime `...THH:MM:SS[Z]`."""
+    if not spec:
+        return None
+    from datetime import datetime, timezone
+    s = spec.strip().lower()
+    now = time.time()
+    if s == "today":
+        n = datetime.now(timezone.utc)
+        return n.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    m = re.fullmatch(r"(\d+)\s*([dhm])", s)
+    if m:
+        n, unit = int(m.group(1)), m.group(2)
+        return now - n * {"d": 86400, "h": 3600, "m": 60}[unit]
+    for fmt_ in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(spec.strip(), fmt_)\
+                .replace(tzinfo=timezone.utc).timestamp()
+        except ValueError:
+            continue
+    die(f"bad --since '{spec}' (try 7d, 1d, today, or YYYY-MM-DD)")
+
+
+def channel_labels(env_name):
+    """Best-effort offline id -> '#name' map from the send/name cache, so the
+    renderer can show readable channel headings without a network call."""
+    labels = {}
+    d = STATE_DIR / "names"
+    if d.exists():
+        for p in d.glob(f"{env_name}#*"):
+            try:
+                cid = p.read_text().strip()
+            except OSError:
+                continue
+            labels[cid] = "#" + p.name.split("#", 1)[1]
+    return labels
+
+
+def _ctx_lines(m, indent):
+    """Render one message for `context`: a header line plus indented references
+    to reactions and attachments (attachments are NAMED, never inlined)."""
+    tag = " (owner)" if m.get("owner") else \
+        (f" ({m['trust']})" if m.get("trust") else "")
+    when = m.get("time") or m.get("id") or ""
+    out = [f"{indent}[{when}] {m.get('from', '?')}{tag}: {m.get('text', '')}"]
+    if m.get("reactions"):
+        out.append(indent + "    {" + " ".join(
+            f":{n}:x{c}" for n, c in m["reactions"].items()) + "}")
+    for f in m.get("files") or []:
+        out.append(f"{indent}    [attachment: {os.path.basename(str(f))}]")
+    if m.get("files_note"):
+        out.append(f"{indent}    [{m['files_note']}]")
+    return out
+
+
+def render_context(events, labels, header=None):
+    """Group events by channel, order chronologically, and nest thread replies
+    under their parent. Returns a compact, scannable multi-line string."""
+    def when(e):
+        return event_epoch(e) or 0.0
+    by_chan = {}
+    for e in events:
+        by_chan.setdefault(e.get("channel"), []).append(e)
+    blocks = []
+    if header:
+        blocks.append(header)
+    for cid in sorted(by_chan, key=lambda c: (c is None, c)):
+        msgs = sorted(by_chan[cid], key=when)
+        label = labels.get(cid, cid)
+        heading = f"## {label}" + (f"  ({cid})" if label != cid else "")
+        lines = [heading]
+        ids = {e.get("id") for e in msgs}
+        children = {}
+        roots = []
+        for e in msgs:
+            th = e.get("thread")
+            if th and th != e.get("id") and th in ids:
+                children.setdefault(th, []).append(e)
+            else:
+                roots.append(e)
+        for r in roots:
+            lines += _ctx_lines(r, "")
+            for c in sorted(children.get(r.get("id"), []), key=when):
+                clines = _ctx_lines(c, "    ")
+                clines[0] = "  ↳ " + clines[0].lstrip()  # thread reply, inline
+                lines += clines
+        blocks.append("\n".join(lines))
+    if len(blocks) == (1 if header else 0):
+        blocks.append("(no messages in the selected window)")
+    return "\n\n".join(blocks)
+
+
 def fmt(m, addr=None):
     tag = " (owner)" if m.get("owner") else \
         (f" ({m['trust']})" if m.get("trust") else "")
@@ -1116,9 +1318,14 @@ def main():
                         "$MSGR_AS, else 'default'")
     p.add_argument("--block", action="store_true",
                    help="if nothing is new, block until messages arrive "
-                        "(prints them; exit 3 on --timeout)")
+                        "(prints them, then returns; exit 3 on --timeout)")
+    p.add_argument("--follow", action="store_true",
+                   help="continuous stream (spool): emit the backlog, then "
+                        "keep tailing and emit each new event, advancing the "
+                        "cursor per event, until --timeout (0 = forever). A "
+                        "durable, resumable drop-in for `listen`.")
     p.add_argument("--timeout", type=int, default=0,
-                   help="with --block: max seconds to wait; 0 = forever")
+                   help="with --block/--follow: max seconds; 0 = forever")
     p.add_argument("--interval", type=int, default=10,
                    help="with --block: poll interval in seconds")
     p.add_argument("--peek", action="store_true", help="don't advance cursors")
@@ -1152,6 +1359,18 @@ def main():
                         "default job")
     p.add_argument("--text", action="store_true",
                    help="with --print: human-readable output (default JSONL)")
+
+    p = sub.add_parser("context", help="render the account's journal (spool) "
+                       "as a readable situational-awareness digest")
+    p.add_argument("addr", nargs="?",
+                   help="<acct>:* or <acct>: = all channels; <acct>:<chan> = "
+                        "one channel; omitted = default account, all channels")
+    p.add_argument("--since", metavar="SPEC",
+                   help="window: 7d/1d/today/YYYY-MM-DD; default all retained")
+    p.add_argument("--thread", metavar="TS",
+                   help="zoom to a single thread (root + replies)")
+    p.add_argument("--json", action="store_true",
+                   help="emit the filtered raw events (JSONL) instead")
 
     p = sub.add_parser("login", help="one-time interactive Telegram login")
     p.add_argument("account", nargs="?")
@@ -1243,8 +1462,60 @@ def main():
         print(f"sent to {env_name}{kind}{r['channel']} ts={r['ts']}")
         return
 
+    if args.cmd == "context":
+        # Situational-awareness digest, rendered from the durable journal
+        # (offline, complete incl. thread replies). Address grammar mirrors
+        # read: <acct>:* / <acct>: = all channels; <acct>:<chan> = one channel;
+        # omitted = default account, all channels.
+        if args.addr:
+            en, env, k, t = resolve_addr(cfg, args.addr)
+        else:
+            en, env = pick_account(cfg, None)
+            k, t = "*", "*"
+        client = platform_client(en, env)
+        if not isinstance(client, Slack):
+            die("context is Slack-only for now")
+        # Channel filter (None = every channel). A specific address is
+        # scope-checked and resolved to its id (same as read).
+        channels = None
+        if k != "*":
+            ar = env.get("allow_read")
+            if isinstance(ar, list) and \
+                    not scope_match(cfg, en, k, t, client, ar):
+                die(f"'{args.addr}' is not whitelisted in account '{en}' "
+                    f"allow_read (config)")
+            channels = {client.target_id(k, t)}
+        since = parse_since(args.since) if args.since else None
+        if not spool_path(en).exists():
+            print(f"(no local record yet for account '{en}' — run "
+                  f"`msgr listen {en}` to start a journal)", file=sys.stderr)
+            return
+        events = []
+        for e in spool_iter(en):
+            if channels is not None and e.get("channel") not in channels:
+                continue
+            if args.thread and args.thread not in (e.get("id"),
+                                                   e.get("thread")):
+                continue
+            if since is not None:
+                ep = event_epoch(e)
+                if ep is not None and ep < since:
+                    continue
+            events.append({kk: vv for kk, vv in e.items() if kk != "_seq"})
+        if args.json:
+            for e in events:
+                print(json.dumps(e, ensure_ascii=False))
+            return
+        parts = [f"# {en} — situational awareness"]
+        if args.since:
+            parts.append(f"since {args.since}")
+        if args.thread:
+            parts.append(f"thread {args.thread}")
+        header = "  ".join(parts)
+        print(render_context(events, channel_labels(en), header=header))
+        return
+
     if args.cmd == "read":
-        import time
         if args.thread:
             # one-shot: the whole thread now, no cursor, no blocking
             if len(args.addrs) != 1:
@@ -1325,9 +1596,10 @@ def main():
             return cl.read(k, t, cursor=cursor, files=not args.no_files,
                            limit=args.last or args.limit, **kw)
 
-        if args.block:
-            # blocking starts "from now": initialize fresh cursors (spool and
-            # poll alike) so we never fire on old history.
+        if args.block and not args.follow:
+            # --block starts "from now": initialize fresh cursors (spool and
+            # poll alike) so we never fire on old history. --follow instead
+            # emits the retained backlog first, so it must NOT skip history.
             for en, _chans, _le in spool_groups:
                 if spool_cursor_get(en, args.consumer) is None:
                     spool_cursor_set(en, args.consumer, spool_max_seq(en))
@@ -1377,21 +1649,32 @@ def main():
                             cursor_set(args.consumer, en, k, t, nc))
             return emit, advances, any_new
 
+        waiting = args.block or args.follow
         deadline = time.time() + args.timeout if args.timeout else None
         tail = 0.4  # snappy spool tail; poll accounts stay on --interval
         next_poll = 0.0
         while True:
             now = time.time()
-            do_poll = (not args.block) or now >= next_poll
+            do_poll = (not waiting) or now >= next_poll
             if do_poll:
                 next_poll = now + args.interval
             emit, advances, any_new = collect(do_poll)
-            if any_new or not args.block:
+            # Emit + advance whenever there's anything (always for --follow and
+            # the one-shot paths; for --block only once something arrives).
+            if emit and (args.follow or any_new or not args.block):
                 for m, label in emit:
                     print(fmt(m, label) if args.text
-                          else json.dumps(m, ensure_ascii=False))
+                          else json.dumps(m, ensure_ascii=False), flush=True)
                 for adv in advances:
                     adv()
+            if args.follow:
+                # continuous stream: never return on data; only --timeout ends
+                # it (exit 0 — a stream, not a "nothing arrived" failure).
+                if deadline and time.time() >= deadline:
+                    return
+                time.sleep(tail if have_spool else args.interval)
+                continue
+            if any_new or not args.block:
                 return
             if deadline and time.time() >= deadline:
                 sys.exit(3)
