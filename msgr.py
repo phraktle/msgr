@@ -69,7 +69,10 @@ Patterns (for agents):
   * Attachments (images, files ≤20MB) auto-download to a local spool; the
     printed [attachment: /path] can be opened directly (agents: use your
     file-reading tool on it to view images). --no-files to skip. Slack needs
-    the files:read scope.
+    the files:read scope. In a split-user (broker) setup the reader is a
+    DIFFERENT unix user than msgr: set `files_dir` in config to a path that
+    user can traverse (e.g. /var/lib/msgr/files) — the default lives under
+    the private state dir and only the msgr user can reach it.
   * Reads can be scoped: `allow_read = ["#chan", "@person", ...]` restricts
     an environment to those addresses only (absent = read anything the
     account can see). Use it when the account has more access than the agent
@@ -700,7 +703,13 @@ class Slack:
             return None
         dest.write_bytes(data)
         os.chmod(dest, 0o644)
+        # world-readable down from files_root: in a split-user (broker) setup
+        # the READER of these paths is another unix user than the downloader.
+        # Note the default files_root sits under the private STATE_DIR (0700)
+        # — cross-user delivery needs `files_dir` in config pointing somewhere
+        # the agent user can traverse (e.g. /var/lib/msgr/files).
         os.chmod(dest.parent, 0o755)
+        os.chmod(files_root(), 0o755)
         return str(dest)
 
     def send_file(self, kind, target, path, text=None, thread=None):
@@ -942,7 +951,14 @@ class Slack:
                     if env.get("type") != "events_api":
                         continue
                     ev = env.get("payload", {}).get("event", {})
-                    if ev.get("type") != "message" or ev.get("subtype"):
+                    # subtype None = plain message. A few subtypes are REAL
+                    # human messages and must ingest — file_share above all
+                    # (dropping it silently vanished an owner message whose
+                    # whole point was its attachments, 2026-07-12). Edits,
+                    # joins, deletes, bot housekeeping stay filtered.
+                    if ev.get("type") != "message" or ev.get("subtype") not in (
+                            None, "file_share", "thread_broadcast",
+                            "me_message"):
                         continue
                     if only is not None and ev.get("channel") not in only:
                         continue
