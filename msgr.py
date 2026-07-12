@@ -687,6 +687,14 @@ class Slack:
         if dest.exists():
             return str(dest)
         url = f.get("url_private_download") or f.get("url_private")
+        if not url and f.get("id"):
+            # socket-mode events sometimes carry stub file objects (id only)
+            # — resolve the download URL before giving up
+            try:
+                f = self.api("files.info", file=f["id"]).get("file", {}) or f
+            except Exception:  # noqa: BLE001
+                pass
+            url = f.get("url_private_download") or f.get("url_private")
         if not url or f.get("size", 0) > FILE_CAP:
             return None
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -832,10 +840,21 @@ class Slack:
              "text": ev.get("text", "")}
         if self.trust:
             m["trust"] = self.trust
-        # Reference attachments by name (don't download in the ingester); a
-        # reader/`context` renders them as [attachment: <name>], not inlined.
+        # Download attachments AT INGEST, same as a history read (_entry):
+        # the spool is what routers/readers consume, and in a split-user
+        # setup the ingester is the only place holding the token — a
+        # name-only entry leaves every downstream consumer unable to fetch
+        # the bytes (2026-07-12: a routed upload delivered bare filenames).
+        # Names + a note remain the fallback when a download fails.
         if ev.get("files"):
-            m["files"] = [f.get("name") or "file" for f in ev["files"]]
+            paths = [p for f in ev["files"]
+                     if (p := self._fetch_file(f))]
+            names = [f.get("name") or "file" for f in ev["files"]]
+            m["files"] = paths or None
+            if not paths:
+                m["files_note"] = ("attachments not downloadable: " +
+                                   ", ".join(names) +
+                                   " (files:read scope? size cap?)")
         return m
 
     def listen(self, echo=False, text_out=False, only=None):
