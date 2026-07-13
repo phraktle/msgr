@@ -114,6 +114,96 @@ class ThreadReadTest(unittest.TestCase):
         self.assertEqual(cl.calls[1][1]["cursor"], "CURS")
 
 
+class RenderBlocksTest(unittest.TestCase):
+    """Slack's `text` fallback omits in-message tables entirely (only the
+    surrounding prose survives) — render_blocks recovers them at ingest and
+    stubs other uncovered content-bearing block types."""
+
+    TABLE = {"type": "table", "rows": [
+        [{"type": "raw_text", "text": "tier"},
+         {"type": "raw_text", "text": "cap"}],
+        [{"type": "rich_text",
+          "elements": [{"type": "rich_text_section",
+                        "elements": [{"type": "text", "text": "huge "},
+                                     {"type": "emoji", "name": "fire"}]}]},
+         {"type": "raw_number", "text": "43"}],
+        [{"type": "rich_text",
+          "elements": [{"type": "rich_text_section",
+                        "elements": [{"type": "user", "user_id": "U0BOB"},
+                                     {"type": "link",
+                                      "url": "https://x.io"}]}]},
+         {"type": "raw_text", "text": "a|b"}],
+    ]}
+
+    def test_table_renders_markdown_pipe_table(self):
+        out = msgr.render_blocks([self.TABLE])
+        self.assertEqual(out.splitlines(), [
+            "| tier | cap |",
+            "| --- | --- |",
+            "| huge :fire: | 43 |",
+            "| <@U0BOB>https://x.io | a\\|b |",
+        ])
+
+    def test_text_covered_blocks_render_nothing(self):
+        # the text fallback already carries these — no stub, no duplication
+        blocks = [{"type": "rich_text", "elements": []},
+                  {"type": "section", "text": {"type": "mrkdwn", "text": "x"}},
+                  {"type": "divider"}, {"type": "header"},
+                  {"type": "context"}, {"type": "actions"}]
+        self.assertIsNone(msgr.render_blocks(blocks))
+
+    def test_unknown_block_gets_visible_stub(self):
+        out = msgr.render_blocks([{"type": "video", "title": "demo"}])
+        self.assertEqual(out, "[video block: unrendered]")
+
+    def test_malformed_never_raises(self):
+        self.assertIsNone(msgr.render_blocks(None))
+        self.assertIsNone(msgr.render_blocks("nope"))
+        self.assertIsNone(msgr.render_blocks([None, "x", {}]))
+        # garbage rows/cells degrade to '?', not a crash
+        out = msgr.render_blocks([{"type": "table", "rows": [None, [{}], 7]}])
+        self.assertIn("?", out)
+
+    def test_entry_and_socket_entry_append_rendered_blocks(self):
+        cl = FakeSlack({})
+        m = {**_msg("400.1", "U0BOB", "tiers below"), "blocks": [self.TABLE]}
+        e = cl._entry(m, "C0CHAN")
+        self.assertTrue(e["text"].startswith("tiers below\n| tier | cap |"))
+        # ingester path renders identically
+        ev = {"channel": "C0CHAN", "ts": "400.1", "user": "U0BOB",
+              "text": "tiers below", "blocks": [self.TABLE]}
+        self.assertEqual(cl._socket_entry(ev)["text"], e["text"])
+
+
+class FileNoteTest(unittest.TestCase):
+    def test_partial_download_failure_names_the_failed_file(self):
+        cl = FakeSlack({})
+        cl._fetch_file = \
+            lambda f: "/spool/ok.pdf" if f["id"] == "F1" else None
+        m = {**_msg("500.1", "U0BOB", ""),
+             "files": [{"id": "F1", "name": "ok.pdf"},
+                       {"id": "F2", "name": "gone.pdf"}]}
+        e = cl._entry(m, "C0CHAN")
+        self.assertEqual(e["files"], ["/spool/ok.pdf"])   # success kept
+        self.assertIn("gone.pdf", e["files_note"])        # failure named
+        self.assertNotIn("ok.pdf", e["files_note"])
+
+    def test_canvas_and_list_noted_as_not_exportable(self):
+        cl = FakeSlack({})
+        cl._fetch_file = \
+            lambda f: self.fail("no download attempt for canvas/list")
+        m = {**_msg("500.2", "U0BOB", ""),
+             "files": [{"id": "F3", "name": "plan", "filetype": "quip",
+                        "mode": "canvas"},
+                       {"id": "F4", "title": "tasks", "filetype": "list",
+                        "mode": "list"}]}
+        e = cl._entry(m, "C0CHAN")
+        self.assertIsNone(e["files"])
+        self.assertIn("canvas 'plan': not exportable", e["files_note"])
+        self.assertIn("list 'tasks': not exportable", e["files_note"])
+        self.assertNotIn("files:read", e["files_note"])   # no scope guess
+
+
 # ------------------------------------------------------------- Spool tests
 
 class SpoolBase(unittest.TestCase):
