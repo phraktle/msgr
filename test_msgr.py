@@ -181,6 +181,29 @@ class SpoolAppendTest(SpoolBase):
         self.assertEqual({k: v for k, v in line.items() if k != "_seq"},
                          read_entry)
 
+    def test_socket_entry_downloads_files(self):
+        """The ingester downloads attachments (spool consumers can't — no
+        token cross-user) and journals PATHS; names + a note only when the
+        download fails. Parity with _entry's files handling."""
+        cl = FakeSlack({})
+        cl.env_name = "acct"
+        ev = {"channel": "C0CHAN", "ts": "300.2", "user": "U0BOB",
+              "text": "", "files": [{"id": "F1", "name": "a.pdf"},
+                                    {"id": "F2", "name": "b.pdf"}]}
+        cl._fetch_file = lambda f: f"/spool/{f['id']}-{f['name']}"
+        m = cl._socket_entry(ev)
+        self.assertEqual(m["files"], ["/spool/F1-a.pdf", "/spool/F2-b.pdf"])
+        self.assertNotIn("files_note", m)
+        # read-path parity: same event shape through _entry
+        e = cl._entry({**_msg("300.2", "U0BOB", ""),
+                       "files": ev["files"]}, "C0CHAN")
+        self.assertEqual(e["files"], m["files"])
+
+        cl._fetch_file = lambda f: None  # download failure -> names + note
+        m2 = cl._socket_entry(ev)
+        self.assertIsNone(m2["files"])
+        self.assertIn("a.pdf", m2["files_note"])
+
 
 class SpoolDrainTest(SpoolBase):
     def test_emits_only_after_cursor_and_advances(self):
