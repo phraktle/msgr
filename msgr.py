@@ -556,6 +556,84 @@ def name_cache_set(env_name, name, cid):
     p.write_text(cid)
 
 
+# --------------------------------------------------------- Slack blocks
+#
+# Slack's `text` field is only a fallback rendering of `blocks`, and it omits
+# some content entirely — user-composed in-message tables above all: a message
+# of prose + table arrives with ONLY the prose in `text` (2026-07-13: a
+# colleague's table vanished twice, both messages looked clean). Render what
+# the fallback misses at ingest so it can't silently drop.
+
+# block types whose content the text fallback already carries — never stub
+_TEXT_COVERED_BLOCKS = {"rich_text", "section", "context", "header",
+                        "actions", "divider"}
+
+
+def _el_text(el):
+    """Rich-text-style element(s) -> plain string. Total by design — a
+    malformed block must not kill ingest; anything unparseable renders '?'."""
+    try:
+        if el is None:
+            return ""
+        if isinstance(el, str):
+            return el
+        if isinstance(el, list):
+            return "".join(_el_text(x) for x in el)
+        if not isinstance(el, dict):
+            return str(el)
+        t = el.get("type")
+        if t == "link":
+            return str(el.get("url") or el.get("text") or "")
+        if t == "user":
+            return f"<@{el.get('user_id') or '?'}>"
+        if t == "channel":
+            return f"<#{el.get('channel_id') or '?'}>"
+        if t == "emoji":
+            return f":{el.get('name') or '?'}:"
+        if isinstance(el.get("elements"), list):
+            return _el_text(el["elements"])
+        for k in ("text", "number", "value"):  # raw_text / raw_number cells
+            if el.get(k) is not None:
+                v = el[k]
+                return _el_text(v) if isinstance(v, (dict, list)) else str(v)
+        return "?"
+    except Exception:  # noqa: BLE001
+        return "?"
+
+
+def _cell_text(cell):
+    s = _el_text(cell).replace("\n", " ").strip()
+    return s.replace("|", "\\|")
+
+
+def render_blocks(blocks):
+    """The content `blocks` carry that the `text` fallback misses: tables
+    become markdown pipe-tables; any other uncovered content-bearing type
+    gets a visible stub (a stub beats a silent drop). Returns a string to
+    append to the entry text, or None. Never raises."""
+    if not isinstance(blocks, list):
+        return None
+    out = []
+    for b in blocks:
+        if not isinstance(b, dict):
+            continue
+        t = b.get("type")
+        if t is None or t in _TEXT_COVERED_BLOCKS:
+            continue
+        if t == "table" and isinstance(b.get("rows"), list) and b["rows"]:
+            lines = []
+            for i, row in enumerate(b["rows"]):
+                cells = [_cell_text(c) for c in row] \
+                    if isinstance(row, list) else ["?"]
+                lines.append("| " + " | ".join(cells) + " |")
+                if i == 0:  # first row is the header
+                    lines.append("|" + " --- |" * len(cells))
+            out.append("\n".join(lines))
+        else:
+            out.append(f"[{t} block: unrendered]")
+    return "\n".join(out) or None
+
+
 # ---------------------------------------------------------------- Slack
 
 class Slack:
@@ -758,16 +836,45 @@ class Slack:
         if m.get("reactions"):
             entry["reactions"] = {r["name"]: r.get("count", 1)
                                   for r in m["reactions"]}
+        return self._enrich(entry, m, files=files)
+
+    def _enrich(self, entry, m, files=True):
+        """Shared ingest tail for _entry and _socket_entry: append what the
+        text fallback misses (blocks), attach files with no-silent-drop
+        notes."""
+        extra = render_blocks(m.get("blocks"))
+        if extra:
+            entry["text"] = f"{entry['text']}\n{extra}" \
+                if entry["text"] else extra
         if files and m.get("files"):
-            paths = [p for f in m["files"]
-                     if (p := self._fetch_file(f))]
-            names = [f.get("name") or "file" for f in m["files"]]
-            entry["files"] = paths or None
-            if not paths:
-                entry["files_note"] = ("attachments not downloadable: " +
-                                       ", ".join(names) +
-                                       " (files:read scope? size cap?)")
+            self._attach_files(entry, m["files"])
         return entry
+
+    def _attach_files(self, entry, fs):
+        """Download attachments AT INGEST (the spool is what routers/readers
+        consume, and in a split-user setup only the ingester holds the token;
+        2026-07-12: a routed upload delivered bare filenames). EVERY file that
+        yields no local path is named in files_note — mixed success must not
+        drop the failures silently. Canvases/Lists have no downloadable binary
+        by nature: noted as such, not as a scope guess."""
+        paths, notes = [], []
+        for f in fs:
+            if not isinstance(f, dict):
+                continue
+            name = f.get("name") or f.get("title") or "file"
+            ft = (f.get("filetype") or "").lower()
+            if ft in ("canvas", "quip") or f.get("mode") == "canvas":
+                notes.append(f"canvas '{name}': not exportable")
+            elif ft == "list" or f.get("mode") == "list":
+                notes.append(f"list '{name}': not exportable")
+            elif (p := self._fetch_file(f)):
+                paths.append(p)
+            else:
+                notes.append(f"'{name}': not downloadable "
+                             "(files:read scope? size cap?)")
+        entry["files"] = paths or None
+        if notes:
+            entry["files_note"] = "; ".join(notes)
 
     def read(self, kind, target, cursor=None, limit=100, threads=True,
              files=True):
@@ -840,22 +947,7 @@ class Slack:
              "text": ev.get("text", "")}
         if self.trust:
             m["trust"] = self.trust
-        # Download attachments AT INGEST, same as a history read (_entry):
-        # the spool is what routers/readers consume, and in a split-user
-        # setup the ingester is the only place holding the token — a
-        # name-only entry leaves every downstream consumer unable to fetch
-        # the bytes (2026-07-12: a routed upload delivered bare filenames).
-        # Names + a note remain the fallback when a download fails.
-        if ev.get("files"):
-            paths = [p for f in ev["files"]
-                     if (p := self._fetch_file(f))]
-            names = [f.get("name") or "file" for f in ev["files"]]
-            m["files"] = paths or None
-            if not paths:
-                m["files_note"] = ("attachments not downloadable: " +
-                                   ", ".join(names) +
-                                   " (files:read scope? size cap?)")
-        return m
+        return self._enrich(m, ev)
 
     def listen(self, echo=False, text_out=False, only=None):
         """Ingester: append every message event to the durable per-account
