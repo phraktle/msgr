@@ -1574,13 +1574,15 @@ def main():
             return
         # a lone "-" (or no text arg) means read stdin — the unix idiom, so
         # `msgr send addr - <<'EOF'` pipes a multi-line body instead of
-        # posting a literal dash.
+        # posting a literal dash. With --file, an explicit "-" still reads
+        # stdin (the body becomes the upload's caption); only the no-text-arg
+        # form skips stdin, so a bare --file send doesn't hang waiting on it.
         if args.text and args.text != ["-"]:
             text = " ".join(args.text)
-        elif getattr(args, "files", None):
-            text = ""
-        else:
+        elif args.text == ["-"] or not getattr(args, "files", None):
             text = sys.stdin.read().strip()
+        else:
+            text = ""
         if getattr(args, "files", None):
             for i, path in enumerate(args.files):
                 if not os.path.isfile(path):
