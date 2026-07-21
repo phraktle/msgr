@@ -568,6 +568,72 @@ class ReadSpoolCliTest(SpoolBase):
         self.assertTrue(self.jsonl(out))            # still emits, no crash
 
 
+class SendFileCaptionTest(unittest.TestCase):
+    """CLI send with --file: an explicit "-" reads stdin into the upload's
+    caption; the bare no-text-arg form stays caption-less without touching
+    stdin (so it can't hang waiting on it)."""
+
+    CFG = {"accounts": {"acct": {"platform": "slack", "bot_token": "x",
+                                 "allow_post": True}}}
+
+    class CaptureClient:
+        def __init__(self):
+            self.calls = []
+
+        def send_file(self, kind, target, path, text=None, thread=None):
+            self.calls.append({"path": path, "text": text, "thread": thread})
+            return {"channel": "C1", "ts": "(file)"}
+
+        def send(self, kind, target, text, thread=None):
+            self.calls.append({"text": text, "thread": thread})
+            return {"channel": "C1", "ts": "1.0"}
+
+    def run_send(self, argv, stdin):
+        client = self.CaptureClient()
+        with mock.patch.object(msgr, "load_config", return_value=self.CFG), \
+             mock.patch.object(msgr, "platform_client", return_value=client), \
+             mock.patch.object(sys, "stdin", stdin), \
+             mock.patch.object(sys, "argv", ["msgr", "send"] + argv):
+            buf, err = io.StringIO(), io.StringIO()
+            code = 0
+            try:
+                with contextlib.redirect_stdout(buf), \
+                        contextlib.redirect_stderr(err):
+                    msgr.main()
+            except SystemExit as e:
+                code = e.code or 0
+        return client.calls, buf.getvalue(), err.getvalue(), code
+
+    def setUp(self):
+        fd, self.png = tempfile.mkstemp(suffix=".png")
+        os.close(fd)
+        self.addCleanup(os.unlink, self.png)
+
+    def test_explicit_dash_pipes_stdin_caption_with_file(self):
+        calls, out, err, code = self.run_send(
+            ["acct:#ops", "--file", self.png, "-"],
+            io.StringIO("*Facts*\nline two\n"))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["text"], "*Facts*\nline two")
+
+    def test_bare_file_send_never_reads_stdin(self):
+        stdin = mock.Mock()
+        stdin.read.side_effect = AssertionError("stdin must not be read")
+        calls, out, err, code = self.run_send(
+            ["acct:#ops", "--file", self.png], stdin)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["text"], "")
+
+    def test_inline_text_caption_with_file(self):
+        calls, out, err, code = self.run_send(
+            ["acct:#ops", "one line", "--file", self.png],
+            io.StringIO(""))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(calls[0]["text"], "one line")
+
+
 class ParseSinceTest(unittest.TestCase):
     def test_relative_today_and_iso(self):
         now = time.time()
