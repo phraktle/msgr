@@ -57,6 +57,11 @@ Patterns (for agents):
     ~a week of retained situational-awareness memory) as a readable digest:
     grouped by channel, thread replies nested, attachments referenced. Add
     --json for the filtered raw events.
+  * Rotation never deletes: events aging out of the hot spool move to plain
+    weekly archive segments (spool/archive/<acct>/<year>-W<week>.jsonl), kept
+    indefinitely. `msgr search TERM... [--addr a] [--since 6mo]` greps sender+
+    text across archives + hot spool (AND of case-insensitive regexes) and
+    renders hits like `context` (--json for raw events, --limit caps output).
   * To read a whole thread on demand — root + every historical reply, with
     reactions — pass its id: `read ADDR --thread <id>`. One-shot (no cursor):
     conversations.history only returns top-level timeline messages, so old
@@ -189,6 +194,36 @@ def spool_hwm_set(account, seq):
     os.replace(tmp, p)
 
 
+def spool_archive_dir(account):
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", account)
+    return STATE_DIR / "spool" / "archive" / safe
+
+
+def archive_segment_name(ep):
+    """Weekly segment file for an epoch: `<ISO-year>-W<week>.jsonl`. Sorts
+    lexically in chronological order (zero-padded, year-first)."""
+    from datetime import datetime, timezone
+    return datetime.fromtimestamp(ep, timezone.utc).strftime("%G-W%V.jsonl")
+
+
+def spool_archive_iter(account):
+    """Yield archived events oldest-segment-first (with the hot spool after,
+    the sequence is ~chronological). Same line tolerance as spool_iter."""
+    d = spool_archive_dir(account)
+    if not d.exists():
+        return
+    for p in sorted(d.glob("*.jsonl")):
+        with open(p, encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    yield json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+
+
 def event_epoch(e):
     """Best-effort UTC epoch seconds for a spooled event, from its `id` (Slack
     ts is epoch) or its ISO `time`. None if undeterminable (then never pruned
@@ -312,12 +347,14 @@ class Spool:
             self._rotate()
 
     def _rotate(self):
-        """Rewrite the spool atomically, dropping events older than the
-        retention window and then capping to keep_lines. `_seq` values are
-        preserved (they travel in the content), and the high-water mark is
-        persisted so a later prune-to-empty can't reset the sequence."""
+        """Rewrite the spool atomically, moving events older than the
+        retention window (and any size-cap overflow) to the weekly archive
+        segments — the hot spool stays a bounded window, the archive keeps
+        everything. `_seq` values are preserved (they travel in the content),
+        and the high-water mark is persisted so a later prune-to-empty can't
+        reset the sequence."""
         cutoff = self._cutoff()
-        kept = []
+        entries = []  # (epoch-or-None, line); None = undatable, never aged out
         with open(self.path, encoding="utf-8") as f:
             for line in f:
                 if not line.strip():
@@ -325,19 +362,42 @@ class Spool:
                 try:
                     ep = event_epoch(json.loads(line))
                 except json.JSONDecodeError:
-                    kept.append(line)  # undatable/garbage: keep, don't lose it
-                    continue
-                if ep is not None and ep < cutoff:
-                    continue  # older than the retention window: drop
-                kept.append(line)
+                    ep = None  # garbage: undatable, keep semantics unchanged
+                entries.append((ep, line))
+        aged = [x for x in entries if x[0] is not None and x[0] < cutoff]
+        kept = [x for x in entries if x[0] is None or x[0] >= cutoff]
+        overflow = kept[:-self.keep_lines] if len(kept) > self.keep_lines \
+            else []
         kept = kept[-self.keep_lines:]  # then honor the size cap
+        self._archive(aged + overflow)
         tmp = self.path.parent / f"{self.path.name}.tmp.{os.getpid()}"
         with open(tmp, "w", encoding="utf-8") as f:
-            f.writelines(ln if ln.endswith("\n") else ln + "\n" for ln in kept)
+            f.writelines(ln if ln.endswith("\n") else ln + "\n"
+                         for _, ln in kept)
             f.flush()
         os.replace(tmp, self.path)  # atomic: readers never see a partial file
         self._lines = len(kept)
         spool_hwm_set(self.account, self._seq)
+
+    def _archive(self, items):
+        """Append dropped (epoch, line) pairs to their weekly archive
+        segments. Archives are append-only and never pruned; undatable lines
+        file under the current week rather than being lost. Runs before the
+        hot-spool rewrite, so a crash between the two can duplicate a line
+        into both (readers dedup by (channel, id)) but never lose one."""
+        if not items:
+            return
+        d = spool_archive_dir(self.account)
+        _ensure_state_dir(d)
+        by_seg = {}
+        for ep, line in items:
+            seg = archive_segment_name(ep if ep is not None else time.time())
+            by_seg.setdefault(seg, []).append(line)
+        for seg, lines in sorted(by_seg.items()):
+            with open(d / seg, "a", encoding="utf-8") as f:
+                f.writelines(ln if ln.endswith("\n") else ln + "\n"
+                             for ln in lines)
+                f.flush()
 
 
 def spool_cursor_path(account, consumer):
@@ -1328,17 +1388,18 @@ def parse_since(spec):
     if s == "today":
         n = datetime.now(timezone.utc)
         return n.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
-    m = re.fullmatch(r"(\d+)\s*([dhm])", s)
+    m = re.fullmatch(r"(\d+)\s*(mo|[dhmwy])", s)
     if m:
         n, unit = int(m.group(1)), m.group(2)
-        return now - n * {"d": 86400, "h": 3600, "m": 60}[unit]
+        return now - n * {"m": 60, "h": 3600, "d": 86400, "w": 7 * 86400,
+                          "mo": 30 * 86400, "y": 365 * 86400}[unit]
     for fmt_ in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
         try:
             return datetime.strptime(spec.strip(), fmt_)\
                 .replace(tzinfo=timezone.utc).timestamp()
         except ValueError:
             continue
-    die(f"bad --since '{spec}' (try 7d, 1d, today, or YYYY-MM-DD)")
+    die(f"bad --since '{spec}' (try 7d, 6mo, today, or YYYY-MM-DD)")
 
 
 def channel_labels(env_name):
@@ -1506,6 +1567,21 @@ def main():
     p.add_argument("--json", action="store_true",
                    help="emit the filtered raw events (JSONL) instead")
 
+    p = sub.add_parser("search", help="grep the whole journal incl. weekly "
+                       "archives: every TERM (case-insensitive regex) must "
+                       "match a message's text or sender")
+    p.add_argument("terms", nargs="+", metavar="TERM")
+    p.add_argument("--addr", metavar="ADDR",
+                   help="scope: <acct>:* (all channels) or <acct>:#chan; "
+                        "default = default account, all channels")
+    p.add_argument("--since", metavar="SPEC",
+                   help="only messages at/after SPEC (e.g. 6mo, 90d, "
+                        "2026-01-01); default = all history")
+    p.add_argument("--limit", type=int, default=200, metavar="N",
+                   help="keep only the newest N hits (default 200)")
+    p.add_argument("--json", action="store_true",
+                   help="raw matching events as JSONL instead of the digest")
+
     p = sub.add_parser("login", help="one-time interactive Telegram login")
     p.add_argument("account", nargs="?")
 
@@ -1649,6 +1725,64 @@ def main():
             parts.append(f"thread {args.thread}")
         header = "  ".join(parts)
         print(render_context(events, channel_labels(en), header=header))
+        return
+
+    if args.cmd == "search":
+        # Offline grep over the account's whole record: weekly archive
+        # segments first, then the hot spool -> ~chronological order. AND
+        # semantics over the terms; matches against sender + text.
+        if args.addr:
+            en, env, k, t = resolve_addr(cfg, args.addr)
+        else:
+            en, env = pick_account(cfg, None)
+            k, t = "*", "*"
+        channels = None
+        if k != "*":
+            client = platform_client(en, env)
+            if not isinstance(client, Slack):
+                die("search is Slack-only for now")
+            ar = env.get("allow_read")
+            if isinstance(ar, list) and \
+                    not scope_match(cfg, en, k, t, client, ar):
+                die(f"'{args.addr}' is not whitelisted in account '{en}' "
+                    f"allow_read (config)")
+            channels = {client.target_id(k, t)}
+        since = parse_since(args.since) if args.since else None
+        try:
+            pats = [re.compile(term, re.IGNORECASE) for term in args.terms]
+        except re.error as ex:
+            die(f"bad pattern: {ex}")
+        hits, seen = [], set()
+        import itertools
+        for e in itertools.chain(spool_archive_iter(en), spool_iter(en)):
+            if channels is not None and e.get("channel") not in channels:
+                continue
+            if since is not None:
+                ep = event_epoch(e)
+                if ep is not None and ep < since:
+                    continue
+            hay = f"{e.get('from', '')}\n{e.get('text', '')}"
+            if not all(pt.search(hay) for pt in pats):
+                continue
+            key = (e.get("channel"), e.get("id"))
+            if key in seen:  # crash-window duplicate (archive + hot spool)
+                continue
+            seen.add(key)
+            hits.append({kk: vv for kk, vv in e.items() if kk != "_seq"})
+        total = len(hits)
+        if args.limit and total > args.limit:
+            hits = hits[-args.limit:]  # newest hits win
+        if args.json:
+            for e in hits:
+                print(json.dumps(e, ensure_ascii=False))
+            return
+        parts = [f"# {en} — search: " + " ".join(args.terms)]
+        if args.since:
+            parts.append(f"since {args.since}")
+        parts.append(f"{total} hit(s)" + (f", newest {len(hits)} shown"
+                                          if len(hits) < total else ""))
+        header = "  ".join(parts)
+        print(render_context(hits, channel_labels(en), header=header))
         return
 
     if args.cmd == "read":

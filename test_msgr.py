@@ -450,6 +450,137 @@ class SpoolRetentionTest(SpoolBase):
                          5)
 
 
+class SpoolArchiveTest(SpoolBase):
+    def archived(self):
+        d = msgr.spool_archive_dir("acct")
+        out = {}
+        for f in sorted(d.glob("*.jsonl")) if d.exists() else []:
+            out[f.name] = [json.loads(ln)
+                           for ln in f.read_text().splitlines() if ln]
+        return out
+
+    def test_size_rotation_archives_overflow_nothing_lost(self):
+        sp = msgr.Spool("acct", max_lines=10, keep_lines=4)
+        for i in range(11):
+            sp.append(self.event("C1", f"m{i}"))   # 11th append -> rotation
+        kept = [e["text"] for e in self.raw_lines()]
+        self.assertEqual(kept, ["m7", "m8", "m9", "m10"])
+        arch = [e["text"] for seg in self.archived().values() for e in seg]
+        self.assertEqual(arch, [f"m{i}" for i in range(7)])  # overflow saved
+        # union hot+archive = everything, no dup, _seq preserved
+        seqs = sorted(e["_seq"] for seg in self.archived().values()
+                      for e in seg) + [e["_seq"] for e in self.raw_lines()]
+        self.assertEqual(seqs, list(range(1, 12)))
+
+    def test_age_rotation_archives_to_weekly_segments(self):
+        sp = msgr.Spool("acct", retention_days=7)
+        old1 = time.time() - 30 * 86400
+        old2 = time.time() - 20 * 86400
+        sp.append(self.event("C1", "ancient", ts=f"{old1:.4f}"))
+        sp.append(self.event("C1", "old", ts=f"{old2:.4f}"))
+        sp.append(self.event("C1", "fresh"))
+        sp._rotate()
+        self.assertEqual([e["text"] for e in self.raw_lines()], ["fresh"])
+        segs = self.archived()
+        self.assertEqual(len(segs), 2)             # two distinct weeks
+        self.assertEqual(list(segs), sorted(segs))  # names sort chronological
+        texts = [e["text"] for seg in segs.values() for e in seg]
+        self.assertEqual(sorted(texts), ["ancient", "old"])
+        for name in segs:
+            self.assertRegex(name, r"^\d{4}-W\d{2}\.jsonl$")
+
+    def test_archive_iter_is_chronological_and_tolerant(self):
+        sp = msgr.Spool("acct", retention_days=7)
+        for days_ago, text in ((30, "a"), (20, "b"), (15, "c")):
+            ts = time.time() - days_ago * 86400
+            sp.append(self.event("C1", text, ts=f"{ts:.4f}"))
+        sp._rotate()
+        d = msgr.spool_archive_dir("acct")
+        (d / "0000-W00.jsonl").write_text("not json\n\n")  # tolerated
+        got = [e["text"] for e in msgr.spool_archive_iter("acct")]
+        self.assertEqual(got, ["a", "b", "c"])
+
+
+class ParseSinceUnitsTest(unittest.TestCase):
+    def test_week_month_year_units(self):
+        now = time.time()
+        for spec, secs in (("2w", 14 * 86400), ("6mo", 180 * 86400),
+                           ("1y", 365 * 86400), ("5m", 300)):
+            got = msgr.parse_since(spec)
+            self.assertAlmostEqual(now - got, secs, delta=5, msg=spec)
+
+
+class SearchCliTest(SpoolBase):
+    CFG = {"accounts": {"acct": {"platform": "slack",
+                                 "bot_token": "x", "app_token": "y"}}}
+
+    def run_search(self, argv):
+        with mock.patch.object(msgr, "load_config", return_value=self.CFG), \
+             mock.patch.object(msgr, "platform_client",
+                               side_effect=lambda en, env:
+                               FakeSlackRead(en, env)), \
+             mock.patch.object(sys, "argv", ["msgr", "search"] + argv):
+            buf, err = io.StringIO(), io.StringIO()
+            code = 0
+            try:
+                with contextlib.redirect_stdout(buf), \
+                        contextlib.redirect_stderr(err):
+                    msgr.main()
+            except SystemExit as e:
+                code = e.code or 0
+            return buf.getvalue(), err.getvalue(), code
+
+    def seed(self):
+        sp = msgr.Spool("acct", retention_days=7)
+        ts = time.time() - 30 * 86400
+        sp.append(self.event("Cops", "deploy failed on venue X",
+                             ts=f"{ts:.4f}"))
+        sp.append(self.event("Cops", "deploy went fine"))
+        sp.append(self.event("Calerts", "unrelated beep"))
+        sp._rotate()  # first event moves to the archive
+
+    def test_search_spans_archive_and_hot_spool(self):
+        self.seed()
+        out, _, _ = self.run_search(["deploy", "--json"])
+        texts = [json.loads(ln)["text"] for ln in out.splitlines() if ln]
+        self.assertEqual(texts, ["deploy failed on venue X",
+                                 "deploy went fine"])
+        self.assertNotIn("_seq", out)
+
+    def test_and_semantics_and_case_insensitive(self):
+        self.seed()
+        out, _, _ = self.run_search(["DEPLOY", "failed", "--json"])
+        texts = [json.loads(ln)["text"] for ln in out.splitlines() if ln]
+        self.assertEqual(texts, ["deploy failed on venue X"])
+
+    def test_since_and_channel_scope(self):
+        self.seed()
+        out, _, _ = self.run_search(["deploy", "--since", "1w", "--json"])
+        self.assertEqual(len([ln for ln in out.splitlines() if ln]), 1)
+        out, _, _ = self.run_search(["beep", "--addr", "acct:#alerts",
+                                     "--json"])
+        texts = [json.loads(ln)["text"] for ln in out.splitlines() if ln]
+        self.assertEqual(texts, ["unrelated beep"])
+
+    def test_limit_keeps_newest(self):
+        self.seed()
+        out, _, _ = self.run_search(["deploy", "--limit", "1", "--json"])
+        texts = [json.loads(ln)["text"] for ln in out.splitlines() if ln]
+        self.assertEqual(texts, ["deploy went fine"])
+
+    def test_rendered_output_mentions_hits(self):
+        self.seed()
+        out, _, _ = self.run_search(["deploy"])
+        self.assertIn("search: deploy", out)
+        self.assertIn("2 hit(s)", out)
+
+    def test_bad_regex_dies_cleanly(self):
+        self.seed()
+        _, err, code = self.run_search(["deploy", "["])
+        self.assertNotEqual(code, 0)
+        self.assertIn("bad pattern", err)
+
+
 class BackendDecisionTest(SpoolBase):
     def test_ingester_active_reflects_flock(self):
         acct = "acct"

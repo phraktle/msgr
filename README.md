@@ -27,6 +27,7 @@ msgr list                                   # what the bot can see
 msgr listen                                     # ingest into the durable spool
 msgr read "acct:*" --as reception --follow      # durable, resumable live stream
 msgr context "acct:*" --since 1d                # readable digest of recent chat
+msgr search "deploy" "failed" --since 6mo       # grep all history incl. archives
 msgr react "#ops" 1712345678.123 white_check_mark
 msgr login news                              # one-time Telegram session setup
 ```
@@ -174,14 +175,39 @@ Layout (under the state dir — `$MSGR_STATE_DIR`, else
 ```
 <state>/spool/<account>.jsonl        append-only log; each line is a normal
                                      read entry + an internal "_seq"
+<state>/spool/archive/<account>/<year>-W<week>.jsonl
+                                     weekly archive segments (plain JSONL,
+                                     kept indefinitely)
 <state>/cursors/<account>/<name>.json  per-consumer last-consumed _seq
 ```
 
 `_seq` is a strictly-increasing, never-reused integer. The spool auto-rotates
-(keeping the most recent lines) once it grows past a cap; `_seq` continues
-across rotation. If a consumer falls so far behind that its cursor was rotated
-away, `read` prints a one-line warning to stderr and resumes from the oldest
-retained event (never silently skips, never errors).
+once it grows past a cap or its oldest event ages out of the retention
+window — rotation moves those events to the weekly archive segments (nothing
+is deleted); `_seq` continues across rotation. If a consumer falls so far
+behind that its cursor was rotated away, `read` prints a one-line warning to
+stderr and resumes from the oldest retained event (never silently skips,
+never errors).
+
+## `search` — grep the whole history
+
+`msgr search TERM... [--addr <address>] [--since <spec>] [--limit N]
+[--json]` greps the account's entire record — weekly archives plus the hot
+spool — and renders hits in the `context` digest format. Deliberately just a
+glorified grep over plain text files: no index, no database, nothing to
+operate. Every TERM is a case-insensitive regex and ALL must match a
+message's sender or text (AND semantics).
+
+```bash
+msgr search "deploy" "failed"            # all history, default account
+msgr search okx --addr "acct:#ops"       # one channel
+msgr search maintenance --since 6mo      # bounded lookback
+msgr search error --limit 50 --json      # newest 50 raw events for scripts
+```
+
+- `--since` additionally accepts `2w` / `6mo` / `1y` here and in `context`.
+- `--limit` keeps the newest N hits (default 200); the header says when
+  truncation happened.
 
 ## Message schema
 
