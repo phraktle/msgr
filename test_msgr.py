@@ -114,6 +114,47 @@ class ThreadReadTest(unittest.TestCase):
         self.assertEqual(cl.calls[1][1]["cursor"], "CURS")
 
 
+class ReactSwapTest(unittest.TestCase):
+    def _armed(self):
+        cl = FakeSlack({})
+        cl.armed = True
+        return cl
+
+    def test_swap_adds_new_then_removes_old_in_order(self):
+        cl = self._armed()
+        cl.react("#", "chan", "1.5", "clock2", swap="clock1")
+        self.assertEqual(
+            [(m, p["name"]) for m, p in cl.calls],
+            [("reactions.add", "clock2"), ("reactions.remove", "clock1")])
+
+    def test_swap_survives_benign_add_failure(self):
+        # already_reacted on the add must not abort the remove
+        cl = self._armed()
+        real_api = cl.api
+        def flaky(method, _quiet=False, **params):
+            real_api(method, **params)
+            if method == "reactions.add":
+                raise SystemExit(1)
+            return {"ok": True}
+        cl.api = flaky
+        cl.react("#", "chan", "1.5", "clock2", swap="clock1")
+        self.assertEqual([m for m, _ in cl.calls],
+                         ["reactions.add", "reactions.remove"])
+
+    def test_plain_react_unchanged(self):
+        cl = self._armed()
+        cl.react("#", "chan", "1.5", "eyes")
+        cl.react("#", "chan", "1.5", "eyes", remove=True)
+        self.assertEqual([m for m, _ in cl.calls],
+                         ["reactions.add", "reactions.remove"])
+
+    def test_swap_strips_colons(self):
+        cl = self._armed()
+        cl.react("#", "chan", "1.5", ":clock2:", swap=":clock1:")
+        self.assertEqual([p["name"] for _, p in cl.calls],
+                         ["clock2", "clock1"])
+
+
 class RenderBlocksTest(unittest.TestCase):
     """Slack's `text` fallback omits in-message tables entirely (only the
     surrounding prose survives) — render_blocks recovers them at ingest and

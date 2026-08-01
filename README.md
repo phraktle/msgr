@@ -29,6 +29,7 @@ msgr read "acct:*" --as reception --follow      # durable, resumable live stream
 msgr context "acct:*" --since 1d                # readable digest of recent chat
 msgr search "deploy" "failed" --since 6mo       # grep all history incl. archives
 msgr react "#ops" 1712345678.123 white_check_mark
+msgr react "#ops" 1712345678.123 clock2 --swap clock1   # add+remove, one process
 msgr edit "#ops" 1712345678.123 "fixed wording"  # amend our own message
 msgr delete "#ops" 1712345678.123               # remove our own message
 msgr login news                              # one-time Telegram session setup

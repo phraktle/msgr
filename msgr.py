@@ -798,9 +798,24 @@ class Slack:
                 self._users[uid] = uid
         return self._users[uid]
 
-    def react(self, kind, target, ts, emoji, remove=False):
+    def react(self, kind, target, ts, emoji, remove=False, swap=None):
         self._check_writable()
         cid = self.target_id(kind, target)
+        if swap:
+            # face swap: add the new emoji, then remove the old one,
+            # back to back in this one process — the visible overlap is a
+            # single API round-trip instead of two CLI invocations. Slack
+            # has no atomic swap, so add-first keeps the message never
+            # bare. Benign races (already_reacted, no_reaction) must not
+            # abort the pair; errors still print, the swap presses on.
+            for method, name in (("reactions.add", emoji),
+                                 ("reactions.remove", swap)):
+                try:
+                    self.api(method, channel=cid, timestamp=ts,
+                             name=name.strip(":"))
+                except SystemExit:
+                    pass
+            return
         self.api("reactions.remove" if remove else "reactions.add",
                  channel=cid, timestamp=ts, name=emoji.strip(":"))
 
@@ -1669,6 +1684,9 @@ def main():
     p.add_argument("ts")
     p.add_argument("emoji")
     p.add_argument("--remove", action="store_true")
+    p.add_argument("--swap", metavar="OLD",
+                   help="after adding EMOJI, remove OLD (one process, "
+                        "minimal flicker)")
 
     p = sub.add_parser("edit", help="edit a Slack message of ours in place "
                        "(chat.update; text args, or '-'/no-arg for stdin)")
@@ -1783,8 +1801,10 @@ def main():
         if args.cmd == "react":
             if not isinstance(client, Slack):
                 die("react is Slack-only")
+            if args.swap and args.remove:
+                die("--swap and --remove are mutually exclusive")
             client.react(kind, target, args.ts, args.emoji,
-                         remove=args.remove)
+                         remove=args.remove, swap=args.swap)
             return
         if args.cmd in ("edit", "delete"):
             # mirror send: same addr resolution + arming above. Slack-only —
