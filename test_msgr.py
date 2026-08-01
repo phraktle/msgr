@@ -765,6 +765,169 @@ class SendFileCaptionTest(unittest.TestCase):
         self.assertEqual(calls[0]["text"], "one line")
 
 
+class EditIngestTest(unittest.TestCase):
+    """message_changed / message_deleted -> typed spool entries. The filters
+    keep bot housekeeping, our own bot's amendments (a coordinator's status
+    line would otherwise loop back into the spool), and Slack's
+    unchanged-text unfurl housekeeping out of the journal."""
+
+    def client(self):
+        cl = FakeSlack({})
+        cl._self = "U0SELF"                    # cached auth.test identity
+        return cl
+
+    @staticmethod
+    def changed(new_text="new", prev_text="old", user="U0BOB", **inner_extra):
+        inner = {"ts": "100.1", "user": user, "text": new_text,
+                 "thread_ts": "100.0"}
+        inner.update(inner_extra)
+        return {"type": "message", "subtype": "message_changed",
+                "channel": "C0CHAN", "ts": "200.5", "message": inner,
+                "previous_message": {"ts": "100.1", "user": user,
+                                     "text": prev_text}}
+
+    def test_edit_entry_shape(self):
+        e = self.client()._edit_entry(self.changed())
+        self.assertEqual(e["id"], "100.1")     # ORIGINAL ts stays the id
+        self.assertEqual(e["edit_of"], "100.1")
+        self.assertEqual(e["prev_text"], "old")
+        self.assertEqual(e["text"], "new")
+        self.assertEqual(e["time"], msgr.iso("200.5"))   # edit time, not post
+        self.assertEqual(e["thread"], "100.0")
+        self.assertEqual(e["user"], "U0BOB")
+        self.assertFalse(e["owner"])
+
+    def test_owner_flag_authenticated_on_edit(self):
+        e = self.client()._edit_entry(self.changed(user="U0OWNER"))
+        self.assertTrue(e["owner"])
+
+    def test_unchanged_text_skipped(self):
+        # Slack re-fires message_changed for its own link-unfurl housekeeping
+        self.assertIsNone(self.client()._edit_entry(
+            self.changed(new_text="same", prev_text="same")))
+
+    def test_bot_and_self_edits_skipped(self):
+        cl = self.client()
+        self.assertIsNone(cl._edit_entry(
+            self.changed(**{"subtype": "bot_message"})))
+        self.assertIsNone(cl._edit_entry(self.changed(bot_id="B123")))
+        self.assertIsNone(cl._edit_entry(self.changed(user="U0SELF")))
+
+    def test_delete_entry_shape(self):
+        ev = {"type": "message", "subtype": "message_deleted",
+              "channel": "C0CHAN", "ts": "200.6", "deleted_ts": "100.1",
+              "previous_message": {"ts": "100.1", "user": "U0BOB",
+                                   "text": "the ask", "thread_ts": "100.0"}}
+        e = self.client()._delete_entry(ev)
+        self.assertEqual(e["id"], "100.1")
+        self.assertEqual(e["delete_of"], "100.1")
+        self.assertEqual(e["text"], "")
+        self.assertEqual(e["prev_text"], "the ask")
+        self.assertEqual(e["thread"], "100.0")
+
+    def test_delete_without_previous_message_still_ingests(self):
+        ev = {"type": "message", "subtype": "message_deleted",
+              "channel": "C0CHAN", "ts": "200.6", "deleted_ts": "100.1"}
+        e = self.client()._delete_entry(ev)
+        self.assertEqual(e["delete_of"], "100.1")
+        self.assertIsNone(e["user"])           # author unknown, tombstone kept
+
+    def test_self_and_bot_deletes_skipped(self):
+        cl = self.client()
+        base = {"type": "message", "subtype": "message_deleted",
+                "channel": "C0CHAN", "ts": "200.6", "deleted_ts": "100.1"}
+        self.assertIsNone(cl._delete_entry(
+            {**base, "previous_message": {"user": "U0SELF", "text": "x"}}))
+        self.assertIsNone(cl._delete_entry(
+            {**base, "previous_message": {"bot_id": "B123", "text": "x"}}))
+
+    def test_human_rendering_markers(self):
+        edit = self.client()._edit_entry(self.changed())
+        self.assertIn("(edited) new", msgr.fmt(edit))
+        self.assertIn("(edited) new", "\n".join(msgr._ctx_lines(edit, "")))
+        dele = {"from": "bob", "text": "", "delete_of": "1.0", "id": "1.0"}
+        self.assertIn("(deleted)", msgr.fmt(dele))
+        # normal entries render untouched
+        self.assertNotIn("(edited)", msgr.fmt({"from": "bob", "text": "hi"}))
+
+
+class EditDeleteVerbTest(unittest.TestCase):
+    """CLI edit/delete: send's addressing + arming rules, Slack-only."""
+
+    CFG = {"accounts": {"acct": {"platform": "slack", "bot_token": "x",
+                                 "allow_post": True}}}
+
+    def run_cmd(self, argv, cfg=None, client=None, arm=True, stdin=""):
+        if client is None:
+            client = FakeSlack({})
+        client.armed = arm
+        with mock.patch.object(msgr, "load_config",
+                               return_value=cfg or self.CFG), \
+             mock.patch.object(msgr, "platform_client", return_value=client), \
+             mock.patch.object(sys, "stdin", io.StringIO(stdin)), \
+             mock.patch.object(sys, "argv", ["msgr"] + argv):
+            buf, err = io.StringIO(), io.StringIO()
+            code = 0
+            try:
+                with contextlib.redirect_stdout(buf), \
+                        contextlib.redirect_stderr(err):
+                    msgr.main()
+            except SystemExit as e:
+                code = e.code or 0
+        return client, buf.getvalue(), err.getvalue(), code
+
+    def test_edit_inline_text(self):
+        cl, out, err, code = self.run_cmd(
+            ["edit", "acct:#ops", "100.1", "fixed", "wording"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(cl.calls, [("chat.update",
+                                     {"channel": "C0CHAN", "ts": "100.1",
+                                      "text": "fixed wording"})])
+        self.assertEqual(out.strip(), "edited acct#C0CHAN ts=100.1")
+
+    def test_edit_dash_reads_stdin(self):
+        cl, out, err, code = self.run_cmd(
+            ["edit", "acct:#ops", "100.1", "-"], stdin="multi\nline\n")
+        self.assertEqual(code, 0, err)
+        self.assertEqual(cl.calls[0][1]["text"], "multi\nline")
+
+    def test_edit_empty_refused(self):
+        cl, _, err, code = self.run_cmd(["edit", "acct:#ops", "100.1"],
+                                        stdin="")
+        self.assertNotEqual(code, 0)
+        self.assertIn("empty message", err)
+        self.assertEqual(cl.calls, [])
+
+    def test_delete(self):
+        cl, out, err, code = self.run_cmd(["delete", "acct:#ops", "100.1"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(cl.calls, [("chat.delete",
+                                     {"channel": "C0CHAN", "ts": "100.1"})])
+        self.assertEqual(out.strip(), "deleted acct#C0CHAN ts=100.1")
+
+    def test_unarmed_account_refused(self):
+        cl, _, err, code = self.run_cmd(["edit", "acct:#ops", "1.0", "x"],
+                                        arm=False)
+        self.assertNotEqual(code, 0)
+        self.assertIn("not armed", err)
+        self.assertEqual(cl.calls, [])
+        cl, _, err, code = self.run_cmd(["delete", "acct:#ops", "1.0"],
+                                        arm=False)
+        self.assertNotEqual(code, 0)
+        self.assertEqual(cl.calls, [])
+
+    def test_non_slack_account_dies_clearly(self):
+        import types
+        dummy = types.SimpleNamespace()
+        cfg = {"accounts": {"tg": {"platform": "telegram", "api_id": 1,
+                                   "api_hash": "x", "allow_post": True}}}
+        for argv in (["edit", "tg:@chan", "5", "x"],
+                     ["delete", "tg:@chan", "5"]):
+            _, _, err, code = self.run_cmd(argv, cfg=cfg, client=dummy)
+            self.assertNotEqual(code, 0)
+            self.assertIn("Slack-only", err)
+
+
 class ParseSinceTest(unittest.TestCase):
     def test_relative_today_and_iso(self):
         now = time.time()

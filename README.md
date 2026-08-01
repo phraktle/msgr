@@ -29,6 +29,8 @@ msgr read "acct:*" --as reception --follow      # durable, resumable live stream
 msgr context "acct:*" --since 1d                # readable digest of recent chat
 msgr search "deploy" "failed" --since 6mo       # grep all history incl. archives
 msgr react "#ops" 1712345678.123 white_check_mark
+msgr edit "#ops" 1712345678.123 "fixed wording"  # amend our own message
+msgr delete "#ops" 1712345678.123               # remove our own message
 msgr login news                              # one-time Telegram session setup
 ```
 
@@ -208,6 +210,23 @@ msgr search error --limit 50 --json      # newest 50 raw events for scripts
 - `--since` additionally accepts `2w` / `6mo` / `1y` here and in `context`.
 - `--limit` keeps the newest N hits (default 200); the header says when
   truncation happened.
+
+## Edits & deletions
+
+`msgr edit <addr> <ts> <text>` (chat.update) and `msgr delete <addr> <ts>`
+(chat.delete) amend the bot's **own** Slack posts — same addressing and
+arming rules as `send`; `edit` reads stdin on `-`. Slack itself enforces
+authorship (only our own messages are editable); its error is surfaced
+as-is.
+
+The ingester journals *other people's* edits and deletions as typed entries:
+an edit keeps the original message `id` (still the valid reply/thread
+target) with the **new** `text` plus `edit_of` and `prev_text`; a deletion
+has empty `text` plus `delete_of`. `--text` and `context` render them as
+`(edited) <new text>` / `(deleted)`. Bot edits, our own bot's amendments,
+and Slack's unchanged-text housekeeping (link unfurls) are filtered at
+ingest, so normal entries keep their exact shape and plain consumers are
+unaffected.
 
 ## Message schema
 

@@ -62,6 +62,15 @@ Patterns (for agents):
     indefinitely. `msgr search TERM... [--addr a] [--since 6mo]` greps sender+
     text across archives + hot spool (AND of case-insensitive regexes) and
     renders hits like `context` (--json for raw events, --limit caps output).
+  * `msgr edit ADDR TS TEXT...` / `msgr delete ADDR TS` amend a Slack message
+    in place (chat.update / chat.delete — the platform only permits the bot's
+    own posts; same arming rules as send; edit reads stdin on '-'). The
+    ingester journals OTHER people's edits/deletions too, as typed entries:
+    an edit keeps the ORIGINAL message id (still the valid reply/thread
+    target) and adds `edit_of` + `prev_text`; a deletion adds `delete_of`
+    with empty text. --text and `context` render them as "(edited) <new
+    text>" / "(deleted)"; JSONL consumers see the extra fields, and plain
+    consumers that ignore unknown fields keep working.
   * To read a whole thread on demand — root + every historical reply, with
     reactions — pass its id: `read ADDR --thread <id>`. One-shot (no cursor):
     conversations.history only returns top-level timeline messages, so old
@@ -818,6 +827,23 @@ class Slack:
             name_cache_set(self.env_name, target.lstrip("#"), resp["channel"])
         return {"channel": resp["channel"], "ts": resp["ts"]}
 
+    def edit(self, kind, target, ts, text):
+        """chat.update — edit one of the bot's own messages in place. Slack
+        itself enforces authorship (only our own posts are editable); its
+        error surfaces verbatim via api(), no pre-check."""
+        self._check_writable()
+        cid = self.target_id(kind, target)
+        self.api("chat.update", channel=cid, ts=ts, text=text)
+        return {"channel": cid, "ts": ts}
+
+    def delete(self, kind, target, ts):
+        """chat.delete — remove one of the bot's own messages. Same
+        authorship rule and error surfacing as edit."""
+        self._check_writable()
+        cid = self.target_id(kind, target)
+        self.api("chat.delete", channel=cid, ts=ts)
+        return {"channel": cid, "ts": ts}
+
     def _fetch_file(self, f):
         fid = f.get("id", "f")
         name = re.sub(r"[^A-Za-z0-9._-]", "_", f.get("name") or "file")
@@ -1009,6 +1035,85 @@ class Slack:
             m["trust"] = self.trust
         return self._enrich(m, ev)
 
+    def _self_id(self):
+        """Our own bot user id (auth.test, cached for the process). Used to
+        keep our own chat.update/chat.delete housekeeping — e.g. a
+        coordinator's transient status line — out of the spool: ingesting it
+        would feed our own writes back to the consumers that caused them."""
+        if not hasattr(self, "_self"):
+            try:
+                self._self = self.api("auth.test", _quiet=True) \
+                    .get("user_id", "")
+            except SystemExit:
+                self._self = ""
+        return self._self
+
+    # message subtypes that are REAL human messages (see listen's filter)
+    _HUMAN_SUBTYPES = (None, "file_share", "thread_broadcast", "me_message")
+
+    def _edit_entry(self, ev):
+        """message_changed -> a typed spool entry, or None to skip. Only real
+        human edits ingest: bot housekeeping (subtype/bot_id), our own bot
+        user (_self_id — else our own chat.updates re-enter the spool as
+        events, a feedback loop), and Slack's no-op message_changed events
+        (link-unfurl housekeeping re-fires with UNCHANGED text) all drop.
+        The entry keeps the ORIGINAL ts as `id` (it stays the valid reply/
+        thread target); `time` is the edit time, `text` the NEW text, plus
+        `edit_of` (= id, the explicit type marker) and `prev_text`."""
+        inner = ev.get("message") or {}
+        prev = ev.get("previous_message") or {}
+        if inner.get("subtype") not in self._HUMAN_SUBTYPES \
+                or inner.get("bot_id"):
+            return None
+        uid = inner.get("user")
+        if uid and uid == self._self_id():
+            return None
+        if inner.get("text", "") == prev.get("text", ""):
+            return None
+        ch = ev.get("channel")
+        m = {"account": self.env_name, "channel": ch,
+             "addr": f"{self.env_name}:{ch}",
+             "id": inner.get("ts"),
+             "time": iso(ev.get("ts") or ev.get("event_ts")),
+             "thread": inner.get("thread_ts"),
+             "from": self.username(uid), "user": uid,
+             "owner": bool(self.owner) and uid == self.owner,
+             "text": inner.get("text", ""),
+             "edit_of": inner.get("ts"),
+             "prev_text": prev.get("text", "")}
+        if self.trust:
+            m["trust"] = self.trust
+        return self._enrich(m, inner)
+
+    def _delete_entry(self, ev):
+        """message_deleted -> a tombstone entry, or None to skip (same bot/
+        self filters as edits — our own status-line delete must not re-enter
+        the spool). Author fields come from previous_message when Slack
+        includes it (absent for old messages: author unknown, still worth a
+        tombstone); `id` is the deleted message's ts, `text` empty,
+        `delete_of` the type marker, `prev_text` what it said."""
+        prev = ev.get("previous_message") or {}
+        if prev.get("subtype") not in self._HUMAN_SUBTYPES \
+                or prev.get("bot_id"):
+            return None
+        uid = prev.get("user")
+        if uid and uid == self._self_id():
+            return None
+        ts = ev.get("deleted_ts")
+        ch = ev.get("channel")
+        m = {"account": self.env_name, "channel": ch,
+             "addr": f"{self.env_name}:{ch}",
+             "id": ts, "time": iso(ev.get("ts") or ev.get("event_ts")),
+             "thread": prev.get("thread_ts"),
+             "from": self.username(uid), "user": uid,
+             "owner": bool(self.owner) and uid == self.owner,
+             "text": "", "delete_of": ts}
+        if prev.get("text"):
+            m["prev_text"] = prev["text"]
+        if self.trust:
+            m["trust"] = self.trust
+        return m
+
     def listen(self, echo=False, text_out=False, only=None):
         """Ingester: append every message event to the durable per-account
         spool (the default job). With echo=True also print each event to stdout
@@ -1125,15 +1230,25 @@ class Slack:
                     # subtype None = plain message. A few subtypes are REAL
                     # human messages and must ingest — file_share above all
                     # (dropping it silently vanished an owner message whose
-                    # whole point was its attachments, 2026-07-12). Edits,
-                    # joins, deletes, bot housekeeping stay filtered.
-                    if ev.get("type") != "message" or ev.get("subtype") not in (
-                            None, "file_share", "thread_broadcast",
-                            "me_message"):
+                    # whole point was its attachments, 2026-07-12). Human
+                    # edits/deletions ingest as TYPED entries (edit_of/
+                    # delete_of; see _edit_entry/_delete_entry for what they
+                    # skip); joins and bot housekeeping stay filtered.
+                    if ev.get("type") != "message":
                         continue
                     if only is not None and ev.get("channel") not in only:
                         continue
-                    m = self._socket_entry(ev)
+                    sub = ev.get("subtype")
+                    if sub == "message_changed":
+                        m = self._edit_entry(ev)
+                    elif sub == "message_deleted":
+                        m = self._delete_entry(ev)
+                    elif sub in self._HUMAN_SUBTYPES:
+                        m = self._socket_entry(ev)
+                    else:
+                        continue
+                    if m is None:
+                        continue
                     spool.append(m)  # durable: the default job
                     if echo:
                         print(json.dumps(m, ensure_ascii=False) if not text_out
@@ -1417,13 +1532,25 @@ def channel_labels(env_name):
     return labels
 
 
+def marked_text(m):
+    """Entry text for human rendering (--text, context, search): typed
+    edit/delete entries get an explicit marker — an edit shows the NEW text,
+    a deletion is a tombstone. JSONL output is untouched (the fields speak
+    for themselves)."""
+    if m.get("delete_of"):
+        return "(deleted)"
+    if m.get("edit_of"):
+        return f"(edited) {m.get('text', '')}"
+    return m.get("text", "")
+
+
 def _ctx_lines(m, indent):
     """Render one message for `context`: a header line plus indented references
     to reactions and attachments (attachments are NAMED, never inlined)."""
     tag = " (owner)" if m.get("owner") else \
         (f" ({m['trust']})" if m.get("trust") else "")
     when = m.get("time") or m.get("id") or ""
-    out = [f"{indent}[{when}] {m.get('from', '?')}{tag}: {m.get('text', '')}"]
+    out = [f"{indent}[{when}] {m.get('from', '?')}{tag}: {marked_text(m)}"]
     if m.get("reactions"):
         out.append(indent + "    {" + " ".join(
             f":{n}:x{c}" for n, c in m["reactions"].items()) + "}")
@@ -1477,7 +1604,7 @@ def fmt(m, addr=None):
     who = m["from"] + tag
     where = f"{addr} " if addr else ""
     when = m.get("time") or m.get("id") or ""
-    line = f"[{where}{when}] {who}: {m['text']}"
+    line = f"[{where}{when}] {who}: {marked_text(m)}"
     if m.get("reactions"):
         line += "  {" + " ".join(f":{n}:x{c}"
                                  for n, c in m["reactions"].items()) + "}"
@@ -1542,6 +1669,17 @@ def main():
     p.add_argument("ts")
     p.add_argument("emoji")
     p.add_argument("--remove", action="store_true")
+
+    p = sub.add_parser("edit", help="edit a Slack message of ours in place "
+                       "(chat.update; text args, or '-'/no-arg for stdin)")
+    p.add_argument("addr")
+    p.add_argument("ts")
+    p.add_argument("text", nargs="*")
+
+    p = sub.add_parser("delete", help="delete a Slack message of ours "
+                       "(chat.delete)")
+    p.add_argument("addr")
+    p.add_argument("ts")
 
     p = sub.add_parser("list", help="list channels the bot can see")
     p.add_argument("account", nargs="?")
@@ -1631,7 +1769,7 @@ def main():
                       only=only)
         return
 
-    if args.cmd in ("react", "send"):
+    if args.cmd in ("react", "send", "edit", "delete"):
         env_name, env, kind, target = resolve_addr(cfg, args.addr)
         if kind == "*":
             die(f"'{args.addr}' is an account-level address (all channels) — "
@@ -1647,6 +1785,26 @@ def main():
                 die("react is Slack-only")
             client.react(kind, target, args.ts, args.emoji,
                          remove=args.remove)
+            return
+        if args.cmd in ("edit", "delete"):
+            # mirror send: same addr resolution + arming above. Slack-only —
+            # only Slack can amend in place — and Slack itself only permits
+            # editing/deleting OUR OWN messages (its error surfaces verbatim
+            # via api(), no pre-check).
+            if not isinstance(client, Slack):
+                die(f"{args.cmd} is Slack-only (account '{env_name}' can't "
+                    f"amend messages)")
+            if args.cmd == "delete":
+                r = client.delete(kind, target, args.ts)
+                print(f"deleted {env_name}{kind}{r['channel']} ts={r['ts']}")
+                return
+            # same stdin idiom as send: a lone "-" (or no text arg) reads it
+            text = " ".join(args.text) if args.text and args.text != ["-"] \
+                else sys.stdin.read().strip()
+            if not text:
+                die("empty message")
+            r = client.edit(kind, target, args.ts, text)
+            print(f"edited {env_name}{kind}{r['channel']} ts={r['ts']}")
             return
         # a lone "-" (or no text arg) means read stdin — the unix idiom, so
         # `msgr send addr - <<'EOF'` pipes a multi-line body instead of
@@ -1764,8 +1922,12 @@ def main():
             hay = f"{e.get('from', '')}\n{e.get('text', '')}"
             if not all(pt.search(hay) for pt in pats):
                 continue
-            key = (e.get("channel"), e.get("id"))
-            if key in seen:  # crash-window duplicate (archive + hot spool)
+            # `time` in the key: an edit/delete entry shares the original's
+            # id (deliberately — it stays the reply target) but is a distinct
+            # event; exact crash-window duplicates (archive + hot spool)
+            # share the time too and still dedup.
+            key = (e.get("channel"), e.get("id"), e.get("time"))
+            if key in seen:
                 continue
             seen.add(key)
             hits.append({kk: vv for kk, vv in e.items() if kk != "_seq"})
