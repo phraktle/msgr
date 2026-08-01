@@ -120,12 +120,14 @@ class ReactSwapTest(unittest.TestCase):
         cl.armed = True
         return cl
 
-    def test_swap_adds_new_then_removes_old_in_order(self):
+    def test_swap_fires_add_and_remove_as_a_pair(self):
+        # parallel by design: order is nondeterministic, the PAIR is the
+        # contract — both calls made, each with the right emoji.
         cl = self._armed()
         cl.react("#", "chan", "1.5", "clock2", swap="clock1")
         self.assertEqual(
-            [(m, p["name"]) for m, p in cl.calls],
-            [("reactions.add", "clock2"), ("reactions.remove", "clock1")])
+            {(m, p["name"]) for m, p in cl.calls},
+            {("reactions.add", "clock2"), ("reactions.remove", "clock1")})
 
     def test_swap_survives_benign_add_failure(self):
         # already_reacted on the add must not abort the remove
@@ -138,8 +140,8 @@ class ReactSwapTest(unittest.TestCase):
             return {"ok": True}
         cl.api = flaky
         cl.react("#", "chan", "1.5", "clock2", swap="clock1")
-        self.assertEqual([m for m, _ in cl.calls],
-                         ["reactions.add", "reactions.remove"])
+        self.assertEqual({m for m, _ in cl.calls},
+                         {"reactions.add", "reactions.remove"})
 
     def test_plain_react_unchanged(self):
         cl = self._armed()
@@ -151,8 +153,8 @@ class ReactSwapTest(unittest.TestCase):
     def test_swap_strips_colons(self):
         cl = self._armed()
         cl.react("#", "chan", "1.5", ":clock2:", swap=":clock1:")
-        self.assertEqual([p["name"] for _, p in cl.calls],
-                         ["clock2", "clock1"])
+        self.assertEqual({p["name"] for _, p in cl.calls},
+                         {"clock2", "clock1"})
 
 
 class RenderBlocksTest(unittest.TestCase):

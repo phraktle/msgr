@@ -113,6 +113,7 @@ import pathlib
 import re
 import socket
 import sys
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -802,19 +803,27 @@ class Slack:
         self._check_writable()
         cid = self.target_id(kind, target)
         if swap:
-            # face swap: add the new emoji, then remove the old one,
-            # back to back in this one process — the visible overlap is a
-            # single API round-trip instead of two CLI invocations. Slack
-            # has no atomic swap, so add-first keeps the message never
-            # bare. Benign races (already_reacted, no_reaction) must not
-            # abort the pair; errors still print, the swap presses on.
-            for method, name in (("reactions.add", emoji),
-                                 ("reactions.remove", swap)):
+            # face swap: the add and the remove touch DIFFERENT emoji, so
+            # they are independent resources and order cannot affect the
+            # final state — fire both in parallel and the visible swap is
+            # the network jitter between two arrivals (tens of ms,
+            # essentially instantaneous) instead of a full round-trip
+            # (Viktor, 2026-08-01). Threads are joined so the process
+            # never exits with a request un-sent; benign races
+            # (already_reacted, no_reaction) print but don't fail the pair.
+            def _call(method, name):
                 try:
                     self.api(method, channel=cid, timestamp=ts,
                              name=name.strip(":"))
                 except SystemExit:
                     pass
+            pair = [threading.Thread(target=_call, args=(m, n))
+                    for m, n in (("reactions.add", emoji),
+                                 ("reactions.remove", swap))]
+            for t in pair:
+                t.start()
+            for t in pair:
+                t.join(timeout=30)
             return
         self.api("reactions.remove" if remove else "reactions.add",
                  channel=cid, timestamp=ts, name=emoji.strip(":"))
