@@ -71,6 +71,10 @@ Patterns (for agents):
     with empty text. --text and `context` render them as "(edited) <new
     text>" / "(deleted)"; JSONL consumers see the extra fields, and plain
     consumers that ignore unknown fields keep working.
+  * Mentions: `text` keeps the raw `<@U123>` token (copy it verbatim to
+    mention that person back); a `mentions` field maps each mentioned id to
+    its display name, and --text / `context` / `search` render it inline as
+    `<@U123> (John Smith)`.
   * To read a whole thread on demand — root + every historical reply, with
     reactions — pass its id: `read ADDR --thread <id>`. One-shot (no cursor):
     conversations.history only returns top-level timeline messages, so old
@@ -633,6 +637,30 @@ def name_cache_set(env_name, name, cid):
 # colleague's table vanished twice, both messages looked clean). Render what
 # the fallback misses at ingest so it can't silently drop.
 
+_MENTION = re.compile(r"<@([UW][A-Z0-9]+)(?:\|[^>]*)?>")
+
+
+def _mention_name(name):
+    """A display name made safe to sit inline in message text: one line, no
+    bracket characters (it must not be able to close the annotation or open
+    a lookalike of anything structural), capped."""
+    name = " ".join(re.sub(r"[<>()\[\]{}]", "", str(name or "")).split())
+    return name[:60]
+
+
+def annotate_mentions(text, mentions):
+    """`<@U123>` -> `<@U123> (John Smith)` for every mention with a resolved
+    name. The raw `<@U…>` token is kept verbatim — it is what a reader copies
+    to mention that person back, and what downstream matchers key on."""
+    if not text or not mentions:
+        return text or ""
+
+    def rep(mo):
+        name = _mention_name(mentions.get(mo.group(1)))
+        return f"{mo.group(0)} ({name})" if name else mo.group(0)
+    return _MENTION.sub(rep, text)
+
+
 # block types whose content the text fallback already carries — never stub
 _TEXT_COVERED_BLOCKS = {"rich_text", "section", "context", "header",
                         "actions", "divider"}
@@ -934,6 +962,23 @@ class Slack:
                 if entry["text"] else extra
         if files and m.get("files"):
             self._attach_files(entry, m["files"])
+        return self._resolve_mentions(entry)
+
+    def _resolve_mentions(self, entry):
+        """`mentions`: {user id: display name} for every `<@U…>` in the text
+        (and an edit's prev_text). An opaque id tells a reader nothing about
+        WHO is being addressed; the name is resolved here, where the token
+        lives, so no consumer has to. `text` itself stays raw. An id that
+        doesn't resolve is simply left out."""
+        found = {}
+        for uid in _MENTION.findall(
+                f"{entry.get('text') or ''}\n{entry.get('prev_text') or ''}"):
+            if uid not in found:
+                name = _mention_name(self.username(uid))
+                if name and name != uid:
+                    found[uid] = name
+        if found:
+            entry["mentions"] = found
         return entry
 
     def _attach_files(self, entry, fs):
@@ -1536,12 +1581,12 @@ def marked_text(m):
     """Entry text for human rendering (--text, context, search): typed
     edit/delete entries get an explicit marker — an edit shows the NEW text,
     a deletion is a tombstone. JSONL output is untouched (the fields speak
-    for themselves)."""
+    for themselves). Mentions are
+    annotated with the resolved name: `<@U123> (John Smith)`."""
     if m.get("delete_of"):
         return "(deleted)"
-    if m.get("edit_of"):
-        return f"(edited) {m.get('text', '')}"
-    return m.get("text", "")
+    text = annotate_mentions(m.get("text", ""), m.get("mentions"))
+    return f"(edited) {text}" if m.get("edit_of") else text
 
 
 def _ctx_lines(m, indent):

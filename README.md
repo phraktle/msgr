@@ -246,6 +246,7 @@ platform):
 | `owner` | true if the sender is the configured operator (authenticated) |
 | `text` | message body |
 | `trust`, `reactions`, `files`, `files_note` | present when applicable |
+| `mentions` | `{user id: display name}` for each `<@U…>` in `text` — present when any resolved. `text` keeps the raw token; `--text`/`context` render `<@U123> (John Smith)` |
 
 Reformat `time`, never `id` (the id is the platform's message key). Add
 `--text` for a human-readable rendering instead of JSON.
